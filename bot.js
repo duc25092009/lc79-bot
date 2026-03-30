@@ -22,8 +22,13 @@ function saveUsers() { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 
 loadData();
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-bot.deleteWebhook(); // Xóa webhook để tránh lỗi
+
+// SỬA DÒNG NÀY:
+bot.deleteWebhook().catch(err => console.log('Webhook error:', err.message));
+
 console.log('✅ Bot đã khởi động!');
+
+// ... phần còn lại giữ nguyên
 
 // API lấy dự đoán
 const API_URL = 'https://living-telecommunications-start-consoles.trycloudflare.com/api/txmd5';
