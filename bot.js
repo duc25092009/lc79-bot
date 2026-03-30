@@ -458,6 +458,30 @@ bot.onText(/\/info(?:\s+(\d+))?/, async (msg, match) => {
     
     bot.sendMessage(chatId, msgText, { parse_mode: 'HTML' });
 });
+// ========== LỆNH ADMIN ==========
+bot.onText(/\/admincmds/, (msg) => {
+    const chatId = msg.chat.id;
+    if (chatId.toString() !== ADMIN_ID) return;
+    const cmds = 
+`📋 <b>LỆNH ADMIN</b>
+
+🔑 <b>Quản lý key:</b>
+/addkey <tên> [thời gian]  - Tạo key (vd: /addkey VIP 1h)
+/keys                     - Xem danh sách key
+/delkey <tên>             - Xóa key (tự xóa user đang dùng)
+
+👥 <b>Quản lý user:</b>
+/users                    - Xem danh sách user
+/info [ID]                - Xem thông tin user
+/deluser <ID>             - Xóa user
+
+⏰ <b>Định dạng thời gian:</b>
+p = phút, h = giờ, d = ngày, t = tuần, th = tháng
+Ví dụ: 1h, 2d, 1t, 3th
+
+📌 <b>Lưu ý:</b> Thời gian hiển thị theo giờ Việt Nam (GMT+7)`;
+    bot.sendMessage(chatId, cmds, { parse_mode: 'HTML' });
+});
 
 // ========== AUTO GỬI ==========
 let lastPhien = 0;
