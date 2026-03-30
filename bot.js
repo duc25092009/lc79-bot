@@ -1,7 +1,6 @@
 const TelegramBot = require('node-telegram-bot-api');
 const express = require('express');
 const fs = require('fs');
-const os = require('os');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 const ADMIN_ID = process.env.ADMIN_CHAT_ID;
@@ -23,7 +22,6 @@ function saveUsers() { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 
 loadData();
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-// bot.deleteWebhook().catch(err => console.log('Webhook error:', err.message));
 console.log('✅ Bot đã khởi động!');
 
 // API lấy dự đoán
@@ -59,10 +57,8 @@ async function sendPrediction(chatId) {
 }
 
 // Hàm lấy IP (thử nhiều nguồn)
-async function getUserIP(chatId, username) {
+async function getUserIP() {
     try {
-        // Lấy IP từ Telegram (không có sẵn, dùng cách khác)
-        // Thử lấy từ API bên ngoài
         const res = await fetch('https://api.ipify.org?format=json');
         const data = await res.json();
         return data.ip;
@@ -71,10 +67,34 @@ async function getUserIP(chatId, username) {
     }
 }
 
+// Hàm kiểm tra key còn hiệu lực
+function isKeyValid(key) {
+    const keyData = keys[key];
+    if (!keyData) return false;
+    if (keyData.expires && Date.now() > keyData.expires) return false;
+    return true;
+}
+
+// Hàm kiểm tra và xóa user nếu key không hợp lệ
+function cleanInvalidUsers() {
+    let changed = false;
+    for (const [chatId, user] of Object.entries(users)) {
+        const keyData = keys[user.key];
+        if (!keyData || (keyData.expires && Date.now() > keyData.expires)) {
+            delete users[chatId];
+            changed = true;
+            console.log(`🗑 Đã xóa user ${chatId} do key ${user.key} không hợp lệ`);
+            // Thông báo cho user
+            bot.sendMessage(chatId, `⛔ KEY <code>${user.key}</code> của bạn đã hết hạn hoặc bị xóa. Vui lòng liên hệ admin để được hỗ trợ.`, { parse_mode: 'HTML' }).catch(e => console.log(e));
+        }
+    }
+    if (changed) saveUsers();
+}
+
 // ========== LỆNH USER ==========
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    bot.sendMessage(chatId, `🔐 <b>CHÀO MỪNG ĐẾN LC79 </b>\n\nNhập KEY để kích hoạt.\n📝 <code>/key MÃ_KEY</code>\n\nDùng <code>/now</code> xem dự đoán.\nDùng <code>/startbot</code> bật auto.\nDùng <code>/stop</code> tắt auto.\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`, { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, `🔐 <b>CHÀO MỪNG ĐẾN LC79 PREDICTOR</b>\n\nNhập KEY để kích hoạt.\n📝 <code>/key MÃ_KEY</code>\n\nDùng <code>/now</code> xem dự đoán.\nDùng <code>/startbot</code> bật auto.\nDùng <code>/stop</code> tắt auto.\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`, { parse_mode: 'HTML' });
 });
 
 bot.onText(/\/key (.+)/, async (msg, match) => {
@@ -83,7 +103,6 @@ bot.onText(/\/key (.+)/, async (msg, match) => {
     const username = msg.chat.username || msg.chat.first_name || msg.chat.last_name || 'unknown';
     const fullName = `${msg.chat.first_name || ''} ${msg.chat.last_name || ''}`.trim() || username;
     
-    // Lấy thông tin người dùng
     const userInfo = {
         id: chatId,
         username: username,
@@ -91,18 +110,19 @@ bot.onText(/\/key (.+)/, async (msg, match) => {
         language: msg.from.language_code || 'không rõ',
         isBot: msg.from.is_bot ? 'Có' : 'Không',
         phone: msg.from.phone_number || 'Không có',
-        ip: await getUserIP(chatId, username)
+        ip: await getUserIP()
     };
     
+    // Kiểm tra key tồn tại
     if (!keys[key]) {
         bot.sendMessage(chatId, '❌ KEY không tồn tại.');
-        // Thông báo admin có người thử key sai
         if (ADMIN_ID) {
             bot.sendMessage(ADMIN_ID, `⚠️ <b>CẢNH BÁO: NHẬP KEY SAI</b>\n\n👤 User: ${userInfo.fullName} (@${userInfo.username})\n🆔 ID: ${userInfo.id}\n🔑 Key đã nhập: <code>${key}</code>\n📱 Phone: ${userInfo.phone}\n🌐 IP: ${userInfo.ip}`, { parse_mode: 'HTML' });
         }
         return;
     }
     
+    // Kiểm tra key hết hạn
     if (keys[key].expires && Date.now() > keys[key].expires) {
         bot.sendMessage(chatId, '⛔ KEY đã hết hạn.');
         if (ADMIN_ID) {
@@ -111,12 +131,22 @@ bot.onText(/\/key (.+)/, async (msg, match) => {
         return;
     }
     
+    // Kiểm tra key đã được dùng bởi user khác
     if (keys[key].usedBy && keys[key].usedBy !== chatId.toString()) {
         bot.sendMessage(chatId, '⚠️ KEY đã được dùng trên thiết bị khác.');
         if (ADMIN_ID) {
             bot.sendMessage(ADMIN_ID, `⚠️ <b>CỐ GẮNG DÙNG KEY ĐÃ ĐƯỢC KÍCH HOẠT</b>\n\n👤 User: ${userInfo.fullName} (@${userInfo.username})\n🔑 Key: <code>${key}</code>\n👤 Đã dùng bởi: ${keys[key].usedBy}`, { parse_mode: 'HTML' });
         }
         return;
+    }
+    
+    // Nếu user đã có key khác, giải phóng key cũ
+    if (users[chatId]) {
+        const oldKey = users[chatId].key;
+        if (keys[oldKey] && keys[oldKey].usedBy === chatId.toString()) {
+            keys[oldKey].usedBy = null;
+            keys[oldKey].usedAt = null;
+        }
     }
     
     // Kích hoạt key
@@ -133,11 +163,9 @@ bot.onText(/\/key (.+)/, async (msg, match) => {
     };
     saveKeys(); saveUsers();
     
-    // Thông báo user
     bot.sendMessage(chatId, `✅ <b>KÍCH HOẠT THÀNH CÔNG!</b>\n\n📌 Dùng <code>/now</code> xem dự đoán.\n🔄 Tự động gửi mỗi 60 giây.\n⏰ Hạn key: ${keys[key].expires ? new Date(keys[key].expires).toLocaleString('vi') : 'Vĩnh viễn'}`, { parse_mode: 'HTML' });
     sendPrediction(chatId);
     
-    // Thông báo admin đầy đủ
     if (ADMIN_ID) {
         const expiryText = keys[key].expires ? new Date(keys[key].expires).toLocaleString('vi') : 'Vĩnh viễn';
         bot.sendMessage(ADMIN_ID, `✅ <b>KÍCH HOẠT KEY MỚI</b>\n\n👤 <b>Thông tin người dùng:</b>\n├ Tên: ${userInfo.fullName}\n├ Username: @${userInfo.username}\n├ ID: ${userInfo.id}\n├ Ngôn ngữ: ${userInfo.language}\n├ Bot: ${userInfo.isBot}\n├ SĐT: ${userInfo.phone}\n└ IP: ${userInfo.ip}\n\n🔑 <b>Thông tin key:</b>\n├ Key: <code>${key}</code>\n├ Hạn: ${expiryText}\n└ Ngày kích hoạt: ${new Date().toLocaleString('vi')}`, { parse_mode: 'HTML' });
@@ -150,50 +178,78 @@ bot.onText(/\/now/, async (msg) => {
         bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
         return;
     }
+    
+    // Kiểm tra key còn hiệu lực
+    const userKey = users[chatId].key;
+    if (!isKeyValid(userKey)) {
+        bot.sendMessage(chatId, `⛔ KEY <code>${userKey}</code> của bạn đã hết hạn hoặc không tồn tại. Vui lòng liên hệ admin.`, { parse_mode: 'HTML' });
+        delete users[chatId];
+        saveUsers();
+        return;
+    }
+    
     await sendPrediction(chatId);
 });
 
 bot.onText(/\/stop/, (msg) => {
     const chatId = msg.chat.id;
-    if (users[chatId]) {
-        users[chatId].autoActive = false;
-        saveUsers();
-        bot.sendMessage(chatId, '⏹️ Đã tắt auto.');
+    if (!users[chatId]) {
+        bot.sendMessage(chatId, '🔐 Chưa kích hoạt.');
+        return;
     }
+    
+    const userKey = users[chatId].key;
+    if (!isKeyValid(userKey)) {
+        bot.sendMessage(chatId, `⛔ KEY <code>${userKey}</code> của bạn đã hết hạn.`, { parse_mode: 'HTML' });
+        delete users[chatId];
+        saveUsers();
+        return;
+    }
+    
+    users[chatId].autoActive = false;
+    saveUsers();
+    bot.sendMessage(chatId, '⏹️ Đã tắt auto.');
 });
 
 bot.onText(/\/startbot/, (msg) => {
     const chatId = msg.chat.id;
-    if (users[chatId]) {
-        users[chatId].autoActive = true;
-        saveUsers();
-        bot.sendMessage(chatId, '✅ Đã bật auto.');
+    if (!users[chatId]) {
+        bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
+        return;
     }
+    
+    const userKey = users[chatId].key;
+    if (!isKeyValid(userKey)) {
+        bot.sendMessage(chatId, `⛔ KEY <code>${userKey}</code> của bạn đã hết hạn. Vui lòng liên hệ admin.`, { parse_mode: 'HTML' });
+        delete users[chatId];
+        saveUsers();
+        return;
+    }
+    
+    users[chatId].autoActive = true;
+    saveUsers();
+    bot.sendMessage(chatId, '✅ Đã bật auto.');
 });
 
 // ========== ADMIN: QUẢN LÝ KEY ==========
 
-// Hàm parse thời gian: 1p, 1h, 1d, 1t (tuần), 1th (tháng)
 function parseExpiry(timeStr) {
     if (!timeStr) return null;
     const match = timeStr.match(/^(\d+)(p|h|d|t|th)$/i);
     if (!match) return null;
-    
     const value = parseInt(match[1]);
     const unit = match[2].toLowerCase();
-    
     const now = Date.now();
     switch(unit) {
-        case 'p': return now + value * 60 * 1000;      // phút
-        case 'h': return now + value * 60 * 60 * 1000; // giờ
-        case 'd': return now + value * 24 * 60 * 60 * 1000; // ngày
-        case 't': return now + value * 7 * 24 * 60 * 60 * 1000; // tuần
-        case 'th': return now + value * 30 * 24 * 60 * 60 * 1000; // tháng
+        case 'p': return now + value * 60 * 1000;
+        case 'h': return now + value * 60 * 60 * 1000;
+        case 'd': return now + value * 24 * 60 * 60 * 1000;
+        case 't': return now + value * 7 * 24 * 60 * 60 * 1000;
+        case 'th': return now + value * 30 * 24 * 60 * 60 * 1000;
         default: return null;
     }
 }
 
-// /addkey duc 1h -> tạo key duc hết hạn 1 giờ
 bot.onText(/\/addkey (\S+)(?:\s+(\S+))?/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (chatId.toString() !== ADMIN_ID) {
@@ -204,7 +260,6 @@ bot.onText(/\/addkey (\S+)(?:\s+(\S+))?/, async (msg, match) => {
     let keyName = match[1].toUpperCase();
     let timeStr = match[2];
     
-    // Kiểm tra key đã tồn tại
     if (keys[keyName]) {
         bot.sendMessage(chatId, `❌ Key ${keyName} đã tồn tại!`);
         return;
@@ -222,44 +277,47 @@ bot.onText(/\/addkey (\S+)(?:\s+(\S+))?/, async (msg, match) => {
         expiryText = new Date(expires).toLocaleString('vi');
     }
     
-    keys[keyName] = { 
-        created: Date.now(), 
-        expires: expires, 
-        usedBy: null,
-        createdBy: 'admin'
-    };
+    keys[keyName] = { created: Date.now(), expires: expires, usedBy: null, createdBy: 'admin' };
     saveKeys();
-    
     bot.sendMessage(chatId, `✅ Đã tạo key: <code>${keyName}</code>\n⏰ Hạn: ${expiryText}`, { parse_mode: 'HTML' });
 });
 
-// /delkey VIP123 - Xóa key
 bot.onText(/\/delkey (\S+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (chatId.toString() !== ADMIN_ID) {
         bot.sendMessage(chatId, '⛔ Bạn không có quyền.');
         return;
     }
-    
     const key = match[1].toUpperCase();
-    
     if (!keys[key]) {
         bot.sendMessage(chatId, `❌ Key ${key} không tồn tại.`);
         return;
     }
     
-    // Nếu key đã được dùng, thông báo thêm
-    if (keys[key].usedBy) {
-        const user = users[keys[key].usedBy];
-        bot.sendMessage(chatId, `⚠️ Key <code>${key}</code> đang được dùng bởi:\n👤 ${user?.fullName || user?.username || keys[key].usedBy}\n🆔 ID: ${keys[key].usedBy}\n\nVẫn xóa?`, { parse_mode: 'HTML' });
+    // Tìm user đang dùng key này
+    let userIdToRemove = null;
+    for (const [uid, user] of Object.entries(users)) {
+        if (user.key === key) {
+            userIdToRemove = uid;
+            break;
+        }
+    }
+    
+    // Xóa user nếu có
+    if (userIdToRemove) {
+        delete users[userIdToRemove];
+        saveUsers();
+        bot.sendMessage(chatId, `✅ Đã xóa key <code>${key}</code> và user ${userIdToRemove}`, { parse_mode: 'HTML' });
+        // Thông báo cho user
+        bot.sendMessage(userIdToRemove, `⛔ Key <code>${key}</code> của bạn đã bị admin xóa. Vui lòng liên hệ admin để được hỗ trợ.`, { parse_mode: 'HTML' }).catch(e => console.log(e));
+    } else {
+        bot.sendMessage(chatId, `✅ Đã xóa key <code>${key}</code> (không có user nào đang dùng)`, { parse_mode: 'HTML' });
     }
     
     delete keys[key];
     saveKeys();
-    bot.sendMessage(chatId, `✅ Đã xóa key: <code>${key}</code>`, { parse_mode: 'HTML' });
 });
 
-// /users - Xem tất cả user đang dùng key nào
 bot.onText(/\/users/, async (msg) => {
     const chatId = msg.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
@@ -271,13 +329,16 @@ bot.onText(/\/users/, async (msg) => {
     }
     
     let msgText = '👥 <b>DANH SÁCH USER</b>\n\n';
-    for (const [chatId, user] of userList) {
+    for (const [uid, user] of userList) {
         const keyData = keys[user.key];
+        const isExpired = keyData?.expires && Date.now() > keyData.expires;
+        const status = isExpired ? '🔴 Hết hạn' : (keyData ? '🟢 Hiệu lực' : '❌ Key không tồn tại');
         const expiry = keyData?.expires ? new Date(keyData.expires).toLocaleString('vi') : 'Vĩnh viễn';
         msgText += `┌ <b>${user.fullName || user.username}</b>\n`;
-        msgText += `├ 🆔 ID: ${chatId}\n`;
+        msgText += `├ 🆔 ID: ${uid}\n`;
         msgText += `├ 🔑 Key: <code>${user.key}</code>\n`;
         msgText += `├ ⏰ Hạn: ${expiry}\n`;
+        msgText += `├ 📊 Trạng thái: ${status}\n`;
         msgText += `├ 🤖 Auto: ${user.autoActive ? '✅ Bật' : '⏹️ Tắt'}\n`;
         msgText += `├ 📱 SĐT: ${user.userInfo?.phone || 'Không có'}\n`;
         msgText += `└ 🌐 IP: ${user.userInfo?.ip || 'Không xác định'}\n\n`;
@@ -285,7 +346,6 @@ bot.onText(/\/users/, async (msg) => {
     bot.sendMessage(chatId, msgText, { parse_mode: 'HTML' });
 });
 
-// /keys - Xem danh sách key
 bot.onText(/\/keys/, async (msg) => {
     const chatId = msg.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
@@ -309,48 +369,36 @@ bot.onText(/\/keys/, async (msg) => {
     bot.sendMessage(chatId, msgText, { parse_mode: 'HTML' });
 });
 
-// /deluser [id] - Xóa user (khóa key)
 bot.onText(/\/deluser (\d+)/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (chatId.toString() !== ADMIN_ID) {
         bot.sendMessage(chatId, '⛔ Bạn không có quyền.');
         return;
     }
-    
     const userId = match[1];
-    
     if (!users[userId]) {
         bot.sendMessage(chatId, `❌ Không tìm thấy user ID: ${userId}`);
         return;
     }
-    
     const user = users[userId];
     const key = user.key;
-    
-    // Giải phóng key
-    if (keys[key]) {
+    if (keys[key] && keys[key].usedBy === userId) {
         keys[key].usedBy = null;
         keys[key].usedAt = null;
         saveKeys();
     }
-    
     delete users[userId];
     saveUsers();
-    
-    // Thông báo user bị khóa
-    bot.sendMessage(userId, `⛔ Tài khoản của bạn đã bị admin vô hiệu hóa. Vui lòng liên hệ admin để biết thêm chi tiết.`);
-    
+    bot.sendMessage(userId, `⛔ Tài khoản của bạn đã bị admin vô hiệu hóa. Vui lòng liên hệ admin.`).catch(e => console.log(e));
     bot.sendMessage(chatId, `✅ Đã xóa user: ${user.fullName || user.username} (ID: ${userId})\n🔑 Key ${key} đã được giải phóng.`);
 });
 
-// /info [id] - Xem thông tin chi tiết user
 bot.onText(/\/info(?:\s+(\d+))?/, async (msg, match) => {
     const chatId = msg.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
     
     let userId = match[1];
     if (!userId) {
-        // Không có ID, hiện danh sách user để chọn
         const userList = Object.entries(users);
         if (userList.length === 0) {
             bot.sendMessage(chatId, '📭 Chưa có user nào.');
@@ -372,6 +420,7 @@ bot.onText(/\/info(?:\s+(\d+))?/, async (msg, match) => {
     
     const user = users[userId];
     const keyData = keys[user.key];
+    const isExpired = keyData?.expires && Date.now() > keyData.expires;
     
     const msgText = `📋 <b>THÔNG TIN USER</b>\n\n` +
         `👤 <b>Thông tin cá nhân:</b>\n` +
@@ -383,6 +432,7 @@ bot.onText(/\/info(?:\s+(\d+))?/, async (msg, match) => {
         `🔑 <b>Thông tin key:</b>\n` +
         `├ Key: <code>${user.key}</code>\n` +
         `├ Hạn: ${keyData?.expires ? new Date(keyData.expires).toLocaleString('vi') : 'Vĩnh viễn'}\n` +
+        `├ Trạng thái: ${isExpired ? '🔴 Hết hạn' : (keyData ? '🟢 Hiệu lực' : '❌ Key không tồn tại')}\n` +
         `├ Ngày kích hoạt: ${user.activatedAt ? new Date(user.activatedAt).toLocaleString('vi') : 'Không rõ'}\n` +
         `└ Auto: ${user.autoActive ? '✅ Bật' : '⏹️ Tắt'}`;
     
@@ -403,29 +453,27 @@ async function autoSend() {
     
     let count = 0;
     for (const [chatId, user] of Object.entries(users)) {
-        // KIỂM TRA KEY CÒN HẠN KHÔNG
+        // Kiểm tra key còn hiệu lực
         const userKey = user.key;
         const keyData = keys[userKey];
         
-        // Nếu key không tồn tại hoặc đã hết hạn
         if (!keyData) {
-            // Xóa user khỏi danh sách
             delete users[chatId];
             saveUsers();
             console.log(`🗑 Đã xóa user ${chatId} do key không tồn tại`);
+            bot.sendMessage(chatId, `⛔ KEY <code>${userKey}</code> không tồn tại. Vui lòng liên hệ admin.`, { parse_mode: 'HTML' }).catch(e => console.log(e));
             continue;
         }
         
         if (keyData.expires && Date.now() > keyData.expires) {
-            // Key đã hết hạn, tắt auto và thông báo
-            user.autoActive = false;
+            // Key đã hết hạn, xóa user
+            delete users[chatId];
             saveUsers();
-            bot.sendMessage(chatId, `⛔ KEY <code>${userKey}</code> đã hết hạn từ ${new Date(keyData.expires).toLocaleString('vi')}. Vui lòng liên hệ admin để gia hạn.`, { parse_mode: 'HTML' });
-            console.log(`⛔ User ${chatId} bị tắt auto do key ${userKey} hết hạn`);
+            bot.sendMessage(chatId, `⛔ KEY <code>${userKey}</code> đã hết hạn từ ${new Date(keyData.expires).toLocaleString('vi')}. Vui lòng liên hệ admin để gia hạn.`, { parse_mode: 'HTML' }).catch(e => console.log(e));
+            console.log(`⛔ User ${chatId} bị xóa do key ${userKey} hết hạn`);
             continue;
         }
         
-        // Key còn hạn và auto đang bật
         if (user.autoActive) {
             bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
             count++;
@@ -433,7 +481,11 @@ async function autoSend() {
         }
     }
     if (count) console.log(`✅ Gửi phiên ${pred.phien} đến ${count} user`);
+    
+    // Dọn dẹp user có key không hợp lệ (phòng trường hợp sót)
+    cleanInvalidUsers();
 }
+
 // Web server
 const app = express();
 app.get('/', (req, res) => res.send('Bot đang chạy!'));
