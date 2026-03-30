@@ -32,7 +32,6 @@ console.log('✅ Bot đã khởi động!');
 const API1_URL = 'https://living-telecommunications-start-consoles.trycloudflare.com/api/txmd5';
 const API2_URL = 'https://lc79-betvip-api-production.up.railway.app/api/lc79_md5?key=apihdx';
 
-// Hàm gọi API với fallback proxy
 async function fetchAPI(url) {
     const proxies = ['https://api.allorigins.win/raw?url=', 'https://corsproxy.io/?', ''];
     for (const proxy of proxies) {
@@ -49,7 +48,6 @@ async function fetchAPI(url) {
     return null;
 }
 
-// API1: dữ liệu đặt cược → dự đoán dựa trên tỷ lệ tiền/người
 async function getPredictionV1() {
     const raw = await fetchAPI(API1_URL);
     if (!raw) return null;
@@ -61,7 +59,6 @@ async function getPredictionV1() {
     const totalPeople = taiPeople + xiuPeople;
     const totalMoney = taiMoney + xiuMoney;
 
-    // Tính điểm: 50% số người + 50% số tiền
     let score = 0.5;
     if (totalPeople > 0) score += (taiPeople - xiuPeople) / totalPeople * 0.25;
     if (totalMoney > 0) score += (taiMoney - xiuMoney) / totalMoney * 0.25;
@@ -70,7 +67,6 @@ async function getPredictionV1() {
     return { prediction, confidence, raw };
 }
 
-// API2: dự đoán AI (du_doan + do_tin_cay)
 async function getPredictionV2() {
     const raw = await fetchAPI(API2_URL);
     if (!raw) return null;
@@ -78,7 +74,6 @@ async function getPredictionV2() {
     if (raw.du_doan) {
         prediction = raw.du_doan === 'Tài' ? 'Tài' : 'Xỉu';
     } else {
-        // fallback: dùng kết quả ván trước (không dùng)
         prediction = raw.ket_qua === 'Tài' ? 'Tài' : 'Xỉu';
     }
     let confidence = 50;
@@ -89,23 +84,19 @@ async function getPredictionV2() {
     return { prediction, confidence, raw };
 }
 
-// API3: mix (ưu tiên API2 nếu tin cậy cao, ngược lại dùng API1)
 async function getPredictionV3() {
     const [v1, v2] = await Promise.all([getPredictionV1(), getPredictionV2()]);
     if (!v1 && !v2) return null;
     if (!v1) return v2;
     if (!v2) return v1;
-
-    // Nếu API2 có độ tin cậy >= 60% và không phải 50-50 quá, ưu tiên API2
     if (v2.confidence >= 60) {
         return { prediction: v2.prediction, confidence: v2.confidence, raw: v2.raw };
     } else {
-        // Nếu API2 tin cậy thấp, dùng API1
         return { prediction: v1.prediction, confidence: v1.confidence, raw: v1.raw };
     }
 }
 
-// ========== CÁC HÀM HỖ TRỢ ==========
+// ========== HÀM HỖ TRỢ ==========
 async function getUserIP() {
     try {
         const res = await fetch('https://api.ipify.org?format=json');
@@ -204,7 +195,7 @@ function formatPredictionMessage(predResult, confidence, rawData) {
         tong = '?';
         ketQua = '?';
     }
-    const msg = `🎲 <b>LC79 DỰ ĐOÁN</b>\n\n` +
+    const reply = `🎲 <b>LC79 DỰ ĐOÁN</b>\n\n` +
                 `📌 Phiên: <b>${rawData?.phien || '?'}</b>\n` +
                 `🎲 Xúc xắc: ${diceStr}\n` +
                 `📊 Tổng: <b>${tong}</b>\n` +
@@ -216,10 +207,10 @@ function formatPredictionMessage(predResult, confidence, rawData) {
                 `├ Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n` +
                 `└ Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult}</b>\n\n` +
                 `⚠️ Chỉ tham khảo, không đảm bảo chính xác.`;
-    return msg;
+    return reply;
 }
 
-// ========== GỬI DỰ ĐOÁN THEO MODE CỦA USER ==========
+// ========== GỬI DỰ ĐOÁN THEO MODE ==========
 async function sendPredictionToUser(chatId) {
     const user = users[chatId];
     if (!user) {
@@ -233,18 +224,18 @@ async function sendPredictionToUser(chatId) {
         return false;
     }
 
-    let mode = user.mode || 'v1'; // mặc định v1
-    let predResult = null, confidence = null, rawData = null;
+    let mode = user.mode || 'v1';
+    let predResult = null, rawData = null;
 
     if (mode === 'v1') {
         const res = await getPredictionV1();
-        if (res) { predResult = res.prediction; confidence = res.confidence; rawData = res.raw; }
+        if (res) { predResult = res.prediction; rawData = res.raw; }
     } else if (mode === 'v2') {
         const res = await getPredictionV2();
-        if (res) { predResult = res.prediction; confidence = res.confidence; rawData = res.raw; }
+        if (res) { predResult = res.prediction; rawData = res.raw; }
     } else if (mode === 'v3') {
         const res = await getPredictionV3();
-        if (res) { predResult = res.prediction; confidence = res.confidence; rawData = res.raw; }
+        if (res) { predResult = res.prediction; rawData = res.raw; }
     }
 
     if (!predResult) {
@@ -252,8 +243,8 @@ async function sendPredictionToUser(chatId) {
         return false;
     }
 
-    const msg = formatPredictionMessage(predResult, confidence, rawData);
-    bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
+    const reply = formatPredictionMessage(predResult, 0, rawData);
+    bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
 
     // Cập nhật thống kê (so sánh dự đoán trước với kết quả thực tế)
     if (stats.lastPhien && stats.lastPhien !== (rawData?.phien || 0) && stats.lastPrediction) {
@@ -266,19 +257,20 @@ async function sendPredictionToUser(chatId) {
 }
 
 // ========== LỆNH USER ==========
-bot.onText(/\/start/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/start/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (users[chatId] && isKeyValid(users[chatId].key)) {
         const mode = users[chatId].mode || 'v1';
-        bot.sendMessage(chatId, `🔐 <b>BẠN ĐÃ KÍCH HOẠT</b>\n\n📌 Dùng <code>/now</code> xem dự đoán.\n🔄 Dùng <code>/startbot</code> bật auto.\n⏹️ Dùng <code>/stop</code> tắt auto.\n📊 Dùng <code>/stats</code> xem thống kê.\n\n⚙️ Chọn nguồn dự đoán:\n<code>/V1</code> - Đám đông\n<code>/V2</code> - AI (LC79)\n<code>/V3</code> - Kết hợp\n\n💡 Hỗ trợ: @mdlvepa`, { parse_mode: 'HTML' });
+        const reply = `🔐 <b>BẠN ĐÃ KÍCH HOẠT</b>\n\n📌 Dùng <code>/now</code> xem dự đoán.\n🔄 Dùng <code>/startbot</code> bật auto.\n⏹️ Dùng <code>/stop</code> tắt auto.\n📊 Dùng <code>/stats</code> xem thống kê.\n\n⚙️ Chọn nguồn dự đoán:\n<code>/V1</code> - Đám đông\n<code>/V2</code> - AI (LC79)\n<code>/V3</code> - Kết hợp\n\n💡 Hỗ trợ: @mdlvepa`;
+        bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
     } else {
-        bot.sendMessage(chatId, `🔐 <b>CHÀO MỪNG ĐẾN LC79 PREDICTOR</b>\n\nNhập KEY để kích hoạt.\n📝 <code>/key MÃ_KEY</code>\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`, { parse_mode: 'HTML' });
+        const reply = `🔐 <b>CHÀO MỪNG ĐẾN LC79 PREDICTOR</b>\n\nNhập KEY để kích hoạt.\n📝 <code>/key MÃ_KEY</code>\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`;
+        bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
     }
 });
 
-// Lệnh chọn mode
-bot.onText(/\/V1/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/V1/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (!users[chatId]) {
         bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
         return;
@@ -287,8 +279,8 @@ bot.onText(/\/V1/, (msg) => {
     saveUsers();
     bot.sendMessage(chatId, '✅ Đã chuyển sang nguồn dự đoán: <b>V1 (Đám đông)</b>', { parse_mode: 'HTML' });
 });
-bot.onText(/\/V2/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/V2/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (!users[chatId]) {
         bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
         return;
@@ -297,8 +289,8 @@ bot.onText(/\/V2/, (msg) => {
     saveUsers();
     bot.sendMessage(chatId, '✅ Đã chuyển sang nguồn dự đoán: <b>V2 (AI LC79)</b>', { parse_mode: 'HTML' });
 });
-bot.onText(/\/V3/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/V3/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (!users[chatId]) {
         bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
         return;
@@ -308,21 +300,20 @@ bot.onText(/\/V3/, (msg) => {
     bot.sendMessage(chatId, '✅ Đã chuyển sang nguồn dự đoán: <b>V3 (Kết hợp)</b>', { parse_mode: 'HTML' });
 });
 
-// Các lệnh cũ giữ nguyên
-bot.onText(/\/key (.+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/key (.+)/, async (msgObj, match) => {
+    const chatId = msgObj.chat.id;
     const rawKey = match[1].trim();
     const key = rawKey.toUpperCase();
-    const username = msg.chat.username || msg.chat.first_name || msg.chat.last_name || 'unknown';
-    const fullName = `${msg.chat.first_name || ''} ${msg.chat.last_name || ''}`.trim() || username;
+    const username = msgObj.chat.username || msgObj.chat.first_name || msgObj.chat.last_name || 'unknown';
+    const fullName = `${msgObj.chat.first_name || ''} ${msgObj.chat.last_name || ''}`.trim() || username;
 
     console.log(`[KEY] User ${chatId} (${fullName}) nhập key: "${rawKey}" -> chuẩn hóa: "${key}"`);
 
     const userInfo = {
         id: chatId, username, fullName,
-        language: msg.from.language_code || 'không rõ',
-        isBot: msg.from.is_bot ? 'Có' : 'Không',
-        phone: msg.from.phone_number || 'Không có',
+        language: msgObj.from.language_code || 'không rõ',
+        isBot: msgObj.from.is_bot ? 'Có' : 'Không',
+        phone: msgObj.from.phone_number || 'Không có',
         ip: await getUserIP()
     };
 
@@ -355,12 +346,13 @@ bot.onText(/\/key (.+)/, async (msg, match) => {
         username, fullName, key,
         autoActive: true,
         activatedAt: Date.now(),
-        mode: 'v1', // mặc định V1
+        mode: 'v1',
         userInfo
     };
     saveKeys(); saveUsers();
 
-    bot.sendMessage(chatId, `✅ <b>KÍCH HOẠT THÀNH CÔNG!</b>\n\n📌 Dùng <code>/now</code> xem dự đoán.\n🔄 Tự động gửi mỗi 60 giây.\n⚙️ Chọn nguồn: /V1, /V2, /V3\n⏰ Hạn key: ${formatVietnamTime(keys[key].expires)}`, { parse_mode: 'HTML' });
+    const reply = `✅ <b>KÍCH HOẠT THÀNH CÔNG!</b>\n\n📌 Dùng <code>/now</code> xem dự đoán.\n🔄 Tự động gửi mỗi 60 giây.\n⚙️ Chọn nguồn: /V1, /V2, /V3\n⏰ Hạn key: ${formatVietnamTime(keys[key].expires)}`;
+    bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
     sendPredictionToUser(chatId);
 
     if (ADMIN_ID) {
@@ -368,8 +360,8 @@ bot.onText(/\/key (.+)/, async (msg, match) => {
     }
 });
 
-bot.onText(/\/now/, async (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/now/, async (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (!users[chatId]) {
         bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
         return;
@@ -377,8 +369,8 @@ bot.onText(/\/now/, async (msg) => {
     await sendPredictionToUser(chatId);
 });
 
-bot.onText(/\/stop/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/stop/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (!users[chatId]) {
         bot.sendMessage(chatId, '🔐 Chưa kích hoạt.');
         return;
@@ -388,8 +380,8 @@ bot.onText(/\/stop/, (msg) => {
     bot.sendMessage(chatId, '⏹️ Đã tắt auto.');
 });
 
-bot.onText(/\/startbot/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/startbot/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (!users[chatId]) {
         bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
         return;
@@ -399,8 +391,8 @@ bot.onText(/\/startbot/, (msg) => {
     bot.sendMessage(chatId, '✅ Đã bật auto.');
 });
 
-bot.onText(/\/stats/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/stats/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (!users[chatId]) {
         bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
         return;
@@ -408,11 +400,11 @@ bot.onText(/\/stats/, (msg) => {
     const analysis = analyzeStreak();
     const accuracy = stats.total > 0 ? ((stats.correct / stats.total) * 100).toFixed(1) : 'Chưa có';
     const breakEmoji = analysis.breakRate > 60 ? '⚠️ CAO' : (analysis.breakRate < 40 ? '✅ THẤP' : '⚖️ TRUNG BÌNH');
-    const msg = `📊 <b>THỐNG KÊ DỰ ĐOÁN</b>\n\n🎯 Độ chính xác: <b>${accuracy}%</b> (${stats.correct}/${stats.total})\n🔄 Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n📈 Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult}</b>\n├ Độ tin cậy bẻ cầu: <b>${analysis.confidence}%</b>\n\nℹ️ Cập nhật sau mỗi phiên mới.`;
-    bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
+    const reply = `📊 <b>THỐNG KÊ DỰ ĐOÁN</b>\n\n🎯 Độ chính xác: <b>${accuracy}%</b> (${stats.correct}/${stats.total})\n🔄 Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n📈 Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult}</b>\n├ Độ tin cậy bẻ cầu: <b>${analysis.confidence}%</b>\n\nℹ️ Cập nhật sau mỗi phiên mới.`;
+    bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
 });
 
-// ========== LỆNH ADMIN (giữ nguyên) ==========
+// ========== LỆNH ADMIN ==========
 function parseExpiry(timeStr) {
     if (!timeStr) return null;
     const match = timeStr.match(/^(\d+)(p|h|d|t|th)$/i);
@@ -430,23 +422,23 @@ function parseExpiry(timeStr) {
     }
 }
 
-bot.onText(/\/admincmds/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/admincmds/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
-    const cmds = `📋 <b>LỆNH ADMIN</b>\n\n🔑 Quản lý key:\n/addkey <tên> [thời gian]\n/keys\n/delkey <tên>\n\n👥 Quản lý user:\n/users\n/info [ID]\n/deluser <ID>\n\n📊 Thống kê:\n/stats\n/resetstats\n\n⏰ Định dạng: 1p, 1h, 1d, 1t, 1th\n📌 Giờ Việt Nam (GMT+7)`;
-    bot.sendMessage(chatId, cmds, { parse_mode: 'HTML' });
+    const reply = `📋 <b>LỆNH ADMIN</b>\n\n🔑 Quản lý key:\n/addkey <tên> [thời gian]\n/keys\n/delkey <tên>\n\n👥 Quản lý user:\n/users\n/info [ID]\n/deluser <ID>\n\n📊 Thống kê:\n/stats\n/resetstats\n\n⏰ Định dạng: 1p, 1h, 1d, 1t, 1th\n📌 Giờ Việt Nam (GMT+7)`;
+    bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
 });
 
-bot.onText(/\/resetstats/, (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/resetstats/, (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
     stats = { predictions: [], total: 0, correct: 0, breakRate: 0, lastPhien: 0, lastResult: null, lastPrediction: null };
     saveStats();
     bot.sendMessage(chatId, '✅ Đã reset thống kê.');
 });
 
-bot.onText(/\/addkey (\S+)(?:\s+(\S+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/addkey (\S+)(?:\s+(\S+))?/, async (msgObj, match) => {
+    const chatId = msgObj.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
     let keyName = match[1].toUpperCase();
     let timeStr = match[2];
@@ -462,8 +454,8 @@ bot.onText(/\/addkey (\S+)(?:\s+(\S+))?/, async (msg, match) => {
     bot.sendMessage(chatId, `✅ Đã tạo key: <code>${keyName}</code>\n⏰ Hạn: ${expiryText}`, { parse_mode: 'HTML' });
 });
 
-bot.onText(/\/delkey (\S+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/delkey (\S+)/, async (msgObj, match) => {
+    const chatId = msgObj.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
     const key = match[1].toUpperCase();
     if (!keys[key]) { bot.sendMessage(chatId, `❌ Key ${key} không tồn tại.`); return; }
@@ -481,38 +473,38 @@ bot.onText(/\/delkey (\S+)/, async (msg, match) => {
     saveKeys();
 });
 
-bot.onText(/\/users/, async (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/users/, async (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
     const userList = Object.entries(users);
     if (userList.length === 0) { bot.sendMessage(chatId, '📭 Chưa có user.'); return; }
-    let msgText = '👥 <b>DANH SÁCH USER</b>\n\n';
+    let reply = '👥 <b>DANH SÁCH USER</b>\n\n';
     for (const [uid, user] of userList) {
         const keyData = keys[user.key];
         const expiry = formatVietnamTime(keyData?.expires);
-        msgText += `┌ <b>${user.fullName || user.username}</b>\n├ 🆔 ID: ${uid}\n├ 🔑 Key: <code>${user.key}</code>\n├ ⏰ Hạn: ${expiry}\n├ 🤖 Auto: ${user.autoActive ? '✅' : '⏹️'}\n├ 🧠 Mode: ${(user.mode || 'v1').toUpperCase()}\n├ 📱 SĐT: ${user.userInfo?.phone || 'Không có'}\n└ 🌐 IP: ${user.userInfo?.ip || 'Không xác định'}\n\n`;
+        reply += `┌ <b>${user.fullName || user.username}</b>\n├ 🆔 ID: ${uid}\n├ 🔑 Key: <code>${user.key}</code>\n├ ⏰ Hạn: ${expiry}\n├ 🤖 Auto: ${user.autoActive ? '✅' : '⏹️'}\n├ 🧠 Mode: ${(user.mode || 'v1').toUpperCase()}\n├ 📱 SĐT: ${user.userInfo?.phone || 'Không có'}\n└ 🌐 IP: ${user.userInfo?.ip || 'Không xác định'}\n\n`;
     }
-    bot.sendMessage(chatId, msgText, { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
 });
 
-bot.onText(/\/keys/, async (msg) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/keys/, async (msgObj) => {
+    const chatId = msgObj.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
     const keyList = Object.keys(keys);
     if (keyList.length === 0) { bot.sendMessage(chatId, '📭 Chưa có key.'); return; }
-    let msgText = '📋 <b>DANH SÁCH KEY</b>\n\n';
+    let reply = '📋 <b>DANH SÁCH KEY</b>\n\n';
     for (const k of keyList) {
         const data = keys[k];
         const isExpired = data.expires && Date.now() > data.expires;
         const status = isExpired ? '🔴 Hết hạn' : (data.usedBy ? `✅ Đã dùng (${data.usedBy})` : '🟢 Chưa dùng');
         const expiryText = formatVietnamTime(data.expires);
-        msgText += `🔑 <code>${k}</code>\n   ├ 📅 Hạn: ${expiryText}\n   └ ${status}\n\n`;
+        reply += `🔑 <code>${k}</code>\n   ├ 📅 Hạn: ${expiryText}\n   └ ${status}\n\n`;
     }
-    bot.sendMessage(chatId, msgText, { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
 });
 
-bot.onText(/\/deluser (\d+)/, async (msg, match) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/deluser (\d+)/, async (msgObj, match) => {
+    const chatId = msgObj.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
     const userId = match[1];
     if (!users[userId]) { bot.sendMessage(chatId, `❌ Không tìm thấy user ID: ${userId}`); return; }
@@ -525,42 +517,40 @@ bot.onText(/\/deluser (\d+)/, async (msg, match) => {
     bot.sendMessage(chatId, `✅ Đã xóa user: ${user.fullName || user.username} (ID: ${userId})`);
 });
 
-bot.onText(/\/info(?:\s+(\d+))?/, async (msg, match) => {
-    const chatId = msg.chat.id;
+bot.onText(/\/info(?:\s+(\d+))?/, async (msgObj, match) => {
+    const chatId = msgObj.chat.id;
     if (chatId.toString() !== ADMIN_ID) return;
     let userId = match[1];
     if (!userId) {
         const userList = Object.entries(users);
         if (userList.length === 0) { bot.sendMessage(chatId, '📭 Chưa có user.'); return; }
-        let msgText = '👥 <b>DANH SÁCH USER</b>\n\n';
-        for (const [id, user] of userList) msgText += `🆔 <code>${id}</code> — ${user.fullName || user.username}\n`;
-        msgText += `\n📝 Dùng <code>/info ID</code> để xem chi tiết.`;
-        bot.sendMessage(chatId, msgText, { parse_mode: 'HTML' });
+        let reply = '👥 <b>DANH SÁCH USER</b>\n\n';
+        for (const [id, user] of userList) reply += `🆔 <code>${id}</code> — ${user.fullName || user.username}\n`;
+        reply += `\n📝 Dùng <code>/info ID</code> để xem chi tiết.`;
+        bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
         return;
     }
     if (!users[userId]) { bot.sendMessage(chatId, `❌ Không tìm thấy user ID: ${userId}`); return; }
     const user = users[userId];
     const keyData = keys[user.key];
-    const msgText = `📋 <b>THÔNG TIN USER</b>\n\n👤 <b>Thông tin cá nhân:</b>\n├ Tên: ${user.fullName || 'Không có'}\n├ Username: @${user.username || 'Không có'}\n├ ID: ${userId}\n├ SĐT: ${user.userInfo?.phone || 'Không có'}\n└ IP: ${user.userInfo?.ip || 'Không xác định'}\n\n🔑 <b>Thông tin key:</b>\n├ Key: <code>${user.key}</code>\n├ Hạn: ${formatVietnamTime(keyData?.expires)}\n├ Ngày kích hoạt: ${user.activatedAt ? formatVietnamTime(user.activatedAt) : 'Không rõ'}\n└ Auto: ${user.autoActive ? '✅ Bật' : '⏹️ Tắt'}\n🧠 Mode: ${(user.mode || 'v1').toUpperCase()}`;
-    bot.sendMessage(chatId, msgText, { parse_mode: 'HTML' });
+    const reply = `📋 <b>THÔNG TIN USER</b>\n\n👤 <b>Thông tin cá nhân:</b>\n├ Tên: ${user.fullName || 'Không có'}\n├ Username: @${user.username || 'Không có'}\n├ ID: ${userId}\n├ SĐT: ${user.userInfo?.phone || 'Không có'}\n└ IP: ${user.userInfo?.ip || 'Không xác định'}\n\n🔑 <b>Thông tin key:</b>\n├ Key: <code>${user.key}</code>\n├ Hạn: ${formatVietnamTime(keyData?.expires)}\n├ Ngày kích hoạt: ${user.activatedAt ? formatVietnamTime(user.activatedAt) : 'Không rõ'}\n└ Auto: ${user.autoActive ? '✅ Bật' : '⏹️ Tắt'}\n🧠 Mode: ${(user.mode || 'v1').toUpperCase()}`;
+    bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
 });
 
 // ========== AUTO GỬI ==========
 let lastPhien = 0;
 async function autoSend() {
-    // Gọi API1 chỉ để lấy phiên hiện tại (dùng chung cho việc cập nhật thống kê)
     const v1 = await getPredictionV1();
     if (!v1) return;
     const phien = v1.raw?.phien || 0;
     if (lastPhien === phien) return;
     lastPhien = phien;
 
-    // Cập nhật thống kê nếu có dự đoán trước đó
     if (stats.lastPhien && stats.lastPhien !== phien && stats.lastPrediction) {
         updateStats(stats.lastPrediction, v1.raw?.ket_qua || '');
     }
     stats.lastPhien = phien;
-    stats.lastPrediction = null; // sẽ được gán khi gửi từng user
+    stats.lastPrediction = null;
 
     let count = 0;
     for (const [chatId, user] of Object.entries(users)) {
@@ -586,16 +576,10 @@ async function autoSend() {
 
         if (!predResult) continue;
 
-        // Cập nhật lastPrediction cho user? Không, chỉ cần thống kê toàn cục
-        // Nhưng để thống kê chính xác, ta sẽ dùng kết quả từ API1 làm chuẩn
-        if (stats.lastPrediction === null) {
-            // Lấy dự đoán của lần đầu tiên (có thể từ bất kỳ user nào) - không lý tưởng
-            // Thực tế, thống kê chỉ dùng cho v1 vì v1 có kết quả thực tế
-            stats.lastPrediction = predResult;
-        }
+        if (stats.lastPrediction === null) stats.lastPrediction = predResult;
 
-        const msg = formatPredictionMessage(predResult, 0, rawData);
-        bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
+        const reply = formatPredictionMessage(predResult, 0, rawData);
+        bot.sendMessage(chatId, reply, { parse_mode: 'HTML' });
         count++;
         await new Promise(r => setTimeout(r, 300));
     }
