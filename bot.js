@@ -168,7 +168,19 @@ async function checkAndSuggest(chatId, gameType, apiVersion) {
 // ========== LỆNH USER ==========
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    bot.sendMessage(chatId, `🔐 <b>CHÀO MỪNG ĐẾN LC79 PREDICTOR</b>\n\nNhập KEY để kích hoạt.\n📝 <code>/key MÃ_KEY</code>\n\nDùng <code>/now</code> xem dự đoán.\nDùng <code>/startbot</code> bật auto.\nDùng <code>/stop</code> tắt auto.\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`, { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, `🔐 <b>CHÀO MỪNG ĐẾN LC79 PREDICTOR</b>\n\nNhập KEY để kích hoạt.\n📝 <code>/key MÃ_KEY</code>\n\nDùng <code>/now</code> xem dự đoán.\nDùng <code>/startbot</code> bật auto.\nDùng <code>/stop</code> tắt auto.\n\n🎮 Chọn game:\n<code>/game md5 v1</code> - MD5 phiên bản 1\n<code>/game md5 v2</code> - MD5 phiên bản 2\n<code>/game hu</code> - Hũ\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`, { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/key$/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (users[chatId]) {
+        const user = users[chatId];
+        const keyData = keys[user.key];
+        const expiry = keyData?.expires ? formatVietnamTime(keyData.expires) : 'Vĩnh viễn';
+        bot.sendMessage(chatId, `✅ Bạn đã kích hoạt key <code>${user.key}</code> từ ${formatVietnamTime(user.activatedAt)}\n⏰ Hạn: ${expiry}\n🎮 Game hiện tại: ${user.gameType.toUpperCase()} ${user.apiVersion ? user.apiVersion.toUpperCase() : ''}\n\nDùng /game để đổi game.`, { parse_mode: 'HTML' });
+    } else {
+        bot.sendMessage(chatId, '🔐 Bạn chưa có key. Dùng /key MÃ_KEY để kích hoạt.');
+    }
 });
 
 bot.onText(/\/key (.+)/, async (msg, match) => {
@@ -259,20 +271,34 @@ bot.onText(/\/game (\w+)(?:\s+(\w+))?/, async (msg, match) => {
         return;
     }
     let game = match[1].toLowerCase();
-    let version = match[2] ? match[2].toLowerCase() : 'v1';
+    let version = match[2] ? match[2].toLowerCase() : '';
     if (game !== 'md5' && game !== 'hu') {
         bot.sendMessage(chatId, '❌ Game không hợp lệ. Chọn: md5 hoặc hu');
         return;
     }
-    if (game === 'hu') version = '';
-    if (game === 'md5' && version !== 'v1' && version !== 'v2') {
-        bot.sendMessage(chatId, '❌ Phiên bản không hợp lệ. Chọn: v1 hoặc v2');
-        return;
+    if (game === 'hu') {
+        users[chatId].gameType = 'hu';
+        users[chatId].apiVersion = '';
+        saveUsers();
+        bot.sendMessage(chatId, `✅ Đã chuyển sang game: HŨ`);
+    } else if (game === 'md5') {
+        if (!version || (version !== 'v1' && version !== 'v2')) {
+            bot.sendMessage(chatId, '❌ Vui lòng chỉ định phiên bản: v1 hoặc v2. Ví dụ: /game md5 v2');
+            return;
+        }
+        users[chatId].gameType = 'md5';
+        users[chatId].apiVersion = version;
+        saveUsers();
+        bot.sendMessage(chatId, `✅ Đã chuyển sang game: MD5 ${version.toUpperCase()}`);
     }
-    users[chatId].gameType = game;
-    users[chatId].apiVersion = version;
-    saveUsers();
-    bot.sendMessage(chatId, `✅ Đã chuyển sang game: ${game.toUpperCase()} ${version ? version.toUpperCase() : ''}`);
+    // Gửi dự đoán ngay sau khi đổi game để kiểm tra
+    const pred = await getPrediction(users[chatId].gameType, users[chatId].apiVersion);
+    if (pred) {
+        await sendPrediction(chatId, pred);
+        updatePredictionAccuracy({ ...pred, userId: chatId });
+        const acc = getUserAccuracy(chatId, users[chatId].gameType, users[chatId].apiVersion);
+        bot.sendMessage(chatId, `📊 Tỉ lệ đúng hiện tại: ${acc}% (${users[chatId].gameType.toUpperCase()} ${users[chatId].apiVersion ? users[chatId].apiVersion.toUpperCase() : ''})`);
+    }
 });
 
 bot.onText(/\/now/, async (msg) => {
@@ -566,12 +592,11 @@ async function autoSend() {
     }
 }
 
-// ========== WEB SERVER (giữ Render không ngủ) ==========
+// ========== WEB SERVER ==========
 const app = express();
 app.get('/', (req, res) => res.send('Bot đang chạy!'));
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`🌐 Web chạy tại port ${PORT}`));
 
-// ========== KHỞI CHẠY AUTO ==========
 setInterval(autoSend, 60000);
 console.log('⏰ Bot sẵn sàng!');
