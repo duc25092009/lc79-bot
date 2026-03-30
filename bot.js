@@ -403,6 +403,29 @@ async function autoSend() {
     
     let count = 0;
     for (const [chatId, user] of Object.entries(users)) {
+        // KIỂM TRA KEY CÒN HẠN KHÔNG
+        const userKey = user.key;
+        const keyData = keys[userKey];
+        
+        // Nếu key không tồn tại hoặc đã hết hạn
+        if (!keyData) {
+            // Xóa user khỏi danh sách
+            delete users[chatId];
+            saveUsers();
+            console.log(`🗑 Đã xóa user ${chatId} do key không tồn tại`);
+            continue;
+        }
+        
+        if (keyData.expires && Date.now() > keyData.expires) {
+            // Key đã hết hạn, tắt auto và thông báo
+            user.autoActive = false;
+            saveUsers();
+            bot.sendMessage(chatId, `⛔ KEY <code>${userKey}</code> đã hết hạn từ ${new Date(keyData.expires).toLocaleString('vi')}. Vui lòng liên hệ admin để gia hạn.`, { parse_mode: 'HTML' });
+            console.log(`⛔ User ${chatId} bị tắt auto do key ${userKey} hết hạn`);
+            continue;
+        }
+        
+        // Key còn hạn và auto đang bật
         if (user.autoActive) {
             bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
             count++;
@@ -411,7 +434,6 @@ async function autoSend() {
     }
     if (count) console.log(`✅ Gửi phiên ${pred.phien} đến ${count} user`);
 }
-
 // Web server
 const app = express();
 app.get('/', (req, res) => res.send('Bot đang chạy!'));
