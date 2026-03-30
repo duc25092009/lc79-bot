@@ -215,16 +215,16 @@ bot.onText(/\/stats/, (msg) => {
     const accuracy = stats.total > 0 ? ((stats.correct / stats.total) * 100).toFixed(1) : 'Chưa có';
     const breakEmoji = analysis.breakRate > 60 ? '⚠️ CAO' : (analysis.breakRate < 40 ? '✅ THẤP' : '⚖️ TRUNG BÌNH');
     
-    const msg = `📊 <b>THỐNG KÊ DỰ ĐOÁN</b>\n\n` +
-                `🎯 Độ chính xác: <b>${accuracy}%</b>\n` +
-                `├ Đúng: <b>${stats.correct}</b> / ${stats.total} ván\n\n` +
-                `🔄 Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n` +
-                `├ Dựa trên ${analysis.totalPredictions} ván gần nhất\n\n` +
-                `📈 Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult}</b>\n` +
-                `├ Độ tin cậy bẻ cầu: <b>${analysis.confidence}%</b>\n\n` +
-                `ℹ️ Cập nhật sau mỗi phiên mới.`;
+    const statsMessage = `📊 <b>THỐNG KÊ DỰ ĐOÁN</b>\n\n` +
+                         `🎯 Độ chính xác: <b>${accuracy}%</b>\n` +
+                         `├ Đúng: <b>${stats.correct}</b> / ${stats.total} ván\n\n` +
+                         `🔄 Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n` +
+                         `├ Dựa trên ${analysis.totalPredictions} ván gần nhất\n\n` +
+                         `📈 Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult}</b>\n` +
+                         `├ Độ tin cậy bẻ cầu: <b>${analysis.confidence}%</b>\n\n` +
+                         `ℹ️ Cập nhật sau mỗi phiên mới.`;
     
-    bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, statsMessage, { parse_mode: 'HTML' });
 });
 
 bot.onText(/\/key (.+)/, async (msg, match) => {
