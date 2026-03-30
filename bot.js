@@ -7,17 +7,21 @@ const ADMIN_ID = process.env.ADMIN_CHAT_ID;
 
 const KEYS_FILE = 'keys.json';
 const USERS_FILE = 'users.json';
+const STATS_FILE = 'stats.json'; // Lưu lịch sử dự đoán
 
 let keys = {};
 let users = {};
+let stats = { predictions: [], total: 0, correct: 0, breakRate: 0, lastPhien: 0, lastResult: null };
 
 function loadData() {
     try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch(e) { keys = {}; }
     try { users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch(e) { users = {}; }
-    console.log(`Loaded ${Object.keys(keys).length} keys, ${Object.keys(users).length} users`);
+    try { stats = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8')); } catch(e) { stats = { predictions: [], total: 0, correct: 0, breakRate: 0, lastPhien: 0, lastResult: null }; }
+    console.log(`Loaded ${Object.keys(keys).length} keys, ${Object.keys(users).length} users, ${stats.total} predictions`);
 }
 function saveKeys() { fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2)); }
 function saveUsers() { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 2)); }
+function saveStats() { fs.writeFileSync(STATS_FILE, JSON.stringify(stats, null, 2)); }
 
 loadData();
 
@@ -42,18 +46,6 @@ async function getPrediction() {
         console.error('API error:', e.message);
         return null;
     }
-}
-
-async function sendPrediction(chatId) {
-    const pred = await getPrediction();
-    if (!pred) {
-        bot.sendMessage(chatId, '⚠️ Lỗi API, thử lại sau');
-        return;
-    }
-    const diceMap = ['⚀','⚁','⚂','⚃','⚄','⚅'];
-    const diceStr = pred.xuc_xac.map(d => diceMap[d-1]).join(' ');
-    const msg = `🎲 <b>LC79 DỰ ĐOÁN</b>\n\n📌 Phiên: <b>${pred.phien}</b>\n🎲 Xúc xắc: ${diceStr}\n📊 Tổng: <b>${pred.tong}</b>\n${pred.ket_qua === 'Tài' ? '🟢' : '🔴'} Kết quả: <b>${pred.ket_qua}</b>\n\n🤖 Dự đoán phiên tiếp: <b>${pred.ket_qua === 'Tài' ? '🔴 TÀI' : '🟢 XỈU'}</b>\n\n⚠️ Chỉ tham khảo.`;
-    bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
 }
 
 // Hàm lấy IP
@@ -97,10 +89,149 @@ function cleanInvalidUsers() {
     if (changed) saveUsers();
 }
 
+// ========== PHÂN TÍCH CẦU ==========
+function analyzeStreak() {
+    const predictions = stats.predictions;
+    if (predictions.length < 5) return { breakRate: 0, confidence: 0, streak: 0, pattern: 'Chưa đủ dữ liệu' };
+    
+    // Lấy 10 kết quả gần nhất
+    const recent = predictions.slice(-10).map(p => p.result);
+    const currentResult = recent[recent.length - 1];
+    
+    // Tính độ dài chuỗi hiện tại
+    let streak = 1;
+    for (let i = recent.length - 2; i >= 0; i--) {
+        if (recent[i] === currentResult) streak++;
+        else break;
+    }
+    
+    // Tính tỉ lệ bẻ cầu dựa trên lịch sử
+    let breaks = 0;
+    let totalChanges = 0;
+    for (let i = 1; i < predictions.length; i++) {
+        if (predictions[i].result !== predictions[i-1].result) {
+            breaks++;
+        }
+        totalChanges++;
+    }
+    const breakRate = totalChanges > 0 ? (breaks / totalChanges) * 100 : 0;
+    
+    // Tính độ tin cậy dựa trên độ dài chuỗi
+    let confidence = 50;
+    if (streak >= 4) confidence = 35;  // Chuỗi dài, khả năng bẻ cao
+    else if (streak === 3) confidence = 45;
+    else if (streak === 2) confidence = 55;
+    else if (streak === 1) confidence = 65;
+    
+    // Điều chỉnh theo tỉ lệ bẻ lịch sử
+    if (breakRate > 60) confidence -= 10;
+    if (breakRate < 40) confidence += 10;
+    
+    confidence = Math.min(95, Math.max(5, confidence));
+    
+    return { breakRate: Math.round(breakRate), confidence, streak, currentResult, totalPredictions: predictions.length };
+}
+
+// Hàm cập nhật thống kê dự đoán
+function updateStats(prediction, actual) {
+    if (!prediction || !actual) return;
+    
+    // Lưu kết quả
+    stats.predictions.push({
+        time: Date.now(),
+        result: actual,
+        predicted: prediction
+    });
+    
+    // Giữ tối đa 1000 kết quả
+    if (stats.predictions.length > 1000) stats.predictions.shift();
+    
+    // Tính tỉ lệ đúng
+    let correctCount = 0;
+    for (const p of stats.predictions) {
+        if (p.result === p.predicted) correctCount++;
+    }
+    stats.total = stats.predictions.length;
+    stats.correct = correctCount;
+    
+    // Tính tỉ lệ bẻ cầu
+    const analysis = analyzeStreak();
+    stats.breakRate = analysis.breakRate;
+    stats.lastResult = actual;
+    
+    saveStats();
+}
+
+// Hàm tạo tin nhắn dự đoán kèm thống kê
+function formatPredictionMessage(pred) {
+    const analysis = analyzeStreak();
+    const accuracy = stats.total > 0 ? ((stats.correct / stats.total) * 100).toFixed(1) : 'Chưa có';
+    const breakEmoji = analysis.breakRate > 60 ? '⚠️ CAO' : (analysis.breakRate < 40 ? '✅ THẤP' : '⚖️ TRUNG BÌNH');
+    
+    const diceMap = ['⚀','⚁','⚂','⚃','⚄','⚅'];
+    const diceStr = pred.xuc_xac.map(d => diceMap[d-1]).join(' ');
+    
+    let msg = `🎲 <b>LC79 DỰ ĐOÁN</b>\n\n` +
+              `📌 Phiên: <b>${pred.phien}</b>\n` +
+              `🎲 Xúc xắc: ${diceStr}\n` +
+              `📊 Tổng: <b>${pred.tong}</b>\n` +
+              `${pred.ket_qua === 'Tài' ? '🟢' : '🔴'} Kết quả: <b>${pred.ket_qua}</b>\n\n` +
+              `━━━━━━━━━━━━━━━━━━\n` +
+              `🤖 <b>DỰ ĐOÁN PHIÊN TIẾP:</b> <b>${pred.ket_qua === 'Tài' ? '🔴 TÀI' : '🟢 XỈU'}</b>\n\n` +
+              `📊 <b>THỐNG KÊ</b>\n` +
+              `├ Độ chính xác: <b>${accuracy}%</b> (${stats.correct}/${stats.total})\n` +
+              `├ Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n` +
+              `└ Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult || ''}</b>\n\n` +
+              `⚠️ Chỉ tham khảo, không đảm bảo chính xác.`;
+    return msg;
+}
+
+async function sendPrediction(chatId) {
+    const pred = await getPrediction();
+    if (!pred) {
+        bot.sendMessage(chatId, '⚠️ Lỗi API, thử lại sau');
+        return;
+    }
+    const msg = formatPredictionMessage(pred);
+    bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
+    
+    // Cập nhật thống kê (khi có kết quả thực tế)
+    // Lưu ý: Dự đoán hiện tại là cho phiên tiếp, nhưng ta dùng kết quả phiên này để tính độ chính xác cho dự đoán trước đó
+    if (stats.lastPhien && stats.lastPhien !== pred.phien && stats.lastPrediction) {
+        updateStats(stats.lastPrediction, pred.ket_qua);
+    }
+    stats.lastPhien = pred.phien;
+    stats.lastPrediction = pred.ket_qua === 'Tài' ? 'Tài' : 'Xỉu';
+    saveStats();
+}
+
 // ========== LỆNH USER ==========
 bot.onText(/\/start/, (msg) => {
     const chatId = msg.chat.id;
-    bot.sendMessage(chatId, `🔐 <b>CHÀO MỪNG ĐẾN LC79 PREDICTOR</b>\n\nNhập KEY để kích hoạt.\n📝 <code>/key MÃ_KEY</code>\n\nDùng <code>/now</code> xem dự đoán.\nDùng <code>/startbot</code> bật auto.\nDùng <code>/stop</code> tắt auto.\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`, { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, `🔐 <b>CHÀO MỪNG ĐẾN LC79 PREDICTOR</b>\n\nNhập KEY để kích hoạt.\n📝 <code>/key MÃ_KEY</code>\n\nDùng <code>/now</code> xem dự đoán.\nDùng <code>/startbot</code> bật auto.\nDùng <code>/stop</code> tắt auto.\nDùng <code>/stats</code> xem thống kê chi tiết.\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`, { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/stats/, (msg) => {
+    const chatId = msg.chat.id;
+    if (!users[chatId]) {
+        bot.sendMessage(chatId, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY');
+        return;
+    }
+    
+    const analysis = analyzeStreak();
+    const accuracy = stats.total > 0 ? ((stats.correct / stats.total) * 100).toFixed(1) : 'Chưa có';
+    const breakEmoji = analysis.breakRate > 60 ? '⚠️ CAO' : (analysis.breakRate < 40 ? '✅ THẤP' : '⚖️ TRUNG BÌNH');
+    
+    const msg = `📊 <b>THỐNG KÊ DỰ ĐOÁN</b>\n\n` +
+                `🎯 Độ chính xác: <b>${accuracy}%</b>\n` +
+                `├ Đúng: <b>${stats.correct}</b> / ${stats.total} ván\n\n` +
+                `🔄 Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n` +
+                `├ Dựa trên ${analysis.totalPredictions} ván gần nhất\n\n` +
+                `📈 Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult || 'chưa có'}</b>\n` +
+                `├ Độ tin cậy bẻ cầu: <b>${analysis.confidence}%</b>\n\n` +
+                `ℹ️ Cập nhật sau mỗi phiên mới.`;
+    
+    bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
 });
 
 bot.onText(/\/key (.+)/, async (msg, match) => {
@@ -168,7 +299,7 @@ bot.onText(/\/key (.+)/, async (msg, match) => {
     };
     saveKeys(); saveUsers();
 
-    bot.sendMessage(chatId, `✅ <b>KÍCH HOẠT THÀNH CÔNG!</b>\n\n📌 Dùng <code>/now</code> xem dự đoán.\n🔄 Tự động gửi mỗi 60 giây.\n⏰ Hạn key: ${formatVietnamTime(keys[key].expires)}`, { parse_mode: 'HTML' });
+    bot.sendMessage(chatId, `✅ <b>KÍCH HOẠT THÀNH CÔNG!</b>\n\n📌 Dùng <code>/now</code> xem dự đoán.\n🔄 Tự động gửi mỗi 60 giây.\n📊 Dùng <code>/stats</code> xem thống kê.\n⏰ Hạn key: ${formatVietnamTime(keys[key].expires)}`, { parse_mode: 'HTML' });
     sendPrediction(chatId);
 
     if (ADMIN_ID) {
@@ -269,12 +400,27 @@ bot.onText(/\/admincmds/, (msg) => {
 /info [ID]                - Xem thông tin user
 /deluser <ID>             - Xóa user
 
+📊 <b>Thống kê:</b>
+/stats                    - Xem thống kê dự đoán (user cũng dùng được)
+/resetstats               - Reset toàn bộ thống kê (admin)
+
 ⏰ <b>Định dạng thời gian:</b>
 p = phút, h = giờ, d = ngày, t = tuần, th = tháng
 Ví dụ: 1h, 2d, 1t, 3th
 
 📌 <b>Lưu ý:</b> Thời gian hiển thị theo giờ Việt Nam (GMT+7)`;
     bot.sendMessage(chatId, cmds, { parse_mode: 'HTML' });
+});
+
+bot.onText(/\/resetstats/, (msg) => {
+    const chatId = msg.chat.id;
+    if (chatId.toString() !== ADMIN_ID) {
+        bot.sendMessage(chatId, '⛔ Bạn không có quyền.');
+        return;
+    }
+    stats = { predictions: [], total: 0, correct: 0, breakRate: 0, lastPhien: 0, lastResult: null, lastPrediction: null };
+    saveStats();
+    bot.sendMessage(chatId, '✅ Đã reset toàn bộ thống kê dự đoán.');
 });
 
 bot.onText(/\/addkey (\S+)(?:\s+(\S+))?/, async (msg, match) => {
@@ -472,9 +618,15 @@ async function autoSend() {
     if (lastPhien === pred.phien) return;
     lastPhien = pred.phien;
 
-    const diceMap = ['⚀','⚁','⚂','⚃','⚄','⚅'];
-    const diceStr = pred.xuc_xac.map(d => diceMap[d-1]).join(' ');
-    const msg = `🎲 <b>LC79 DỰ ĐOÁN MỚI</b>\n\n📌 Phiên: <b>${pred.phien}</b>\n🎲 Xúc xắc: ${diceStr}\n📊 Tổng: <b>${pred.tong}</b>\n${pred.ket_qua === 'Tài' ? '🟢' : '🔴'} Kết quả: <b>${pred.ket_qua}</b>\n\n🤖 Dự đoán: <b>${pred.ket_qua === 'Tài' ? '🔴 TÀI' : '🟢 XỈU'}</b>`;
+    // Cập nhật thống kê khi có phiên mới
+    if (stats.lastPhien && stats.lastPhien !== pred.phien && stats.lastPrediction) {
+        updateStats(stats.lastPrediction, pred.ket_qua);
+    }
+    stats.lastPhien = pred.phien;
+    stats.lastPrediction = pred.ket_qua === 'Tài' ? 'Tài' : 'Xỉu';
+    saveStats();
+
+    const msg = formatPredictionMessage(pred);
 
     let count = 0;
     for (const [chatId, user] of Object.entries(users)) {
