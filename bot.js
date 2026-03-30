@@ -322,6 +322,63 @@ bot.onText(/\/startbot/, (msg) => {
     }
 });
 
+// ========== ADMIN: TẠO KEY ==========
+const ADMIN_ID = process.env.ADMIN_CHAT_ID; // Chat ID của admin
+
+bot.onText(/\/createkey(?:\s+(\S+))?/, async (msg, match) => {
+    const chatId = msg.chat.id;
+    
+    // Kiểm tra xem có phải admin không
+    if (chatId.toString() !== ADMIN_ID) {
+        bot.sendMessage(chatId, '⛔ Bạn không có quyền sử dụng lệnh này.');
+        return;
+    }
+    
+    let keyName = match[1];
+    if (!keyName) {
+        // Tự động tạo key ngẫu nhiên
+        keyName = Math.random().toString(36).substring(2, 10).toUpperCase();
+    } else {
+        keyName = keyName.toUpperCase();
+    }
+    
+    // Kiểm tra key đã tồn tại chưa
+    if (keys[keyName]) {
+        bot.sendMessage(chatId, `❌ Key ${keyName} đã tồn tại!`);
+        return;
+    }
+    
+    // Tạo key mới (vĩnh viễn)
+    keys[keyName] = {
+        created: Date.now(),
+        expires: null,  // null = vĩnh viễn
+        usedBy: null
+    };
+    saveKeys();
+    
+    bot.sendMessage(chatId, `✅ Đã tạo key: <code>${keyName}</code>\n⏰ Hạn: Vĩnh viễn`, { parse_mode: 'HTML' });
+});
+
+// Thêm lệnh xem danh sách key (admin)
+bot.onText(/\/keys/, async (msg) => {
+    const chatId = msg.chat.id;
+    if (chatId.toString() !== ADMIN_ID) return;
+    
+    const keyList = Object.keys(keys);
+    if (keyList.length === 0) {
+        bot.sendMessage(chatId, '📭 Chưa có key nào.');
+        return;
+    }
+    
+    let msgText = '📋 <b>DANH SÁCH KEY</b>\n\n';
+    for (const k of keyList) {
+        const data = keys[k];
+        const used = data.usedBy ? `✅ Đã dùng (${data.usedBy})` : '🟢 Chưa dùng';
+        msgText += `🔑 <code>${k}</code> — ${used}\n`;
+    }
+    bot.sendMessage(chatId, msgText, { parse_mode: 'HTML' });
+});
+
 // Auto gửi dự đoán
 let lastPhien = 0;
 async function autoSendToUsers() {
