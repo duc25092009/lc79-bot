@@ -23,7 +23,7 @@ function saveUsers() { fs.writeFileSync(USERS_FILE, JSON.stringify(users, null, 
 loadData();
 
 const bot = new TelegramBot(BOT_TOKEN, { polling: true });
-bot.deleteWebhook().catch(err => console.log('Webhook error:', err.message));
+// bot.deleteWebhook().catch(err => console.log('Webhook error:', err.message));
 console.log('✅ Bot đã khởi động!');
 
 // API lấy dự đoán
