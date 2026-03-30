@@ -7,16 +7,16 @@ const ADMIN_ID = process.env.ADMIN_CHAT_ID;
 
 const KEYS_FILE = 'keys.json';
 const USERS_FILE = 'users.json';
-const STATS_FILE = 'stats.json'; // Lưu lịch sử dự đoán
+const STATS_FILE = 'stats.json';
 
 let keys = {};
 let users = {};
-let stats = { predictions: [], total: 0, correct: 0, breakRate: 0, lastPhien: 0, lastResult: null };
+let stats = { predictions: [], total: 0, correct: 0, breakRate: 0, lastPhien: 0, lastResult: null, lastPrediction: null };
 
 function loadData() {
     try { keys = JSON.parse(fs.readFileSync(KEYS_FILE, 'utf8')); } catch(e) { keys = {}; }
     try { users = JSON.parse(fs.readFileSync(USERS_FILE, 'utf8')); } catch(e) { users = {}; }
-    try { stats = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8')); } catch(e) { stats = { predictions: [], total: 0, correct: 0, breakRate: 0, lastPhien: 0, lastResult: null }; }
+    try { stats = JSON.parse(fs.readFileSync(STATS_FILE, 'utf8')); } catch(e) { stats = { predictions: [], total: 0, correct: 0, breakRate: 0, lastPhien: 0, lastResult: null, lastPrediction: null }; }
     console.log(`Loaded ${Object.keys(keys).length} keys, ${Object.keys(users).length} users, ${stats.total} predictions`);
 }
 function saveKeys() { fs.writeFileSync(KEYS_FILE, JSON.stringify(keys, null, 2)); }
@@ -48,7 +48,6 @@ async function getPrediction() {
     }
 }
 
-// Hàm lấy IP
 async function getUserIP() {
     try {
         const res = await fetch('https://api.ipify.org?format=json');
@@ -59,14 +58,12 @@ async function getUserIP() {
     }
 }
 
-// Hàm format thời gian theo giờ Việt Nam (GMT+7)
 function formatVietnamTime(timestamp) {
     if (!timestamp) return 'Vĩnh viễn';
     const date = new Date(timestamp);
     return date.toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
 }
 
-// Hàm kiểm tra key còn hiệu lực
 function isKeyValid(key) {
     const keyData = keys[key];
     if (!keyData) return false;
@@ -74,7 +71,6 @@ function isKeyValid(key) {
     return true;
 }
 
-// Hàm kiểm tra và xóa user nếu key không hợp lệ
 function cleanInvalidUsers() {
     let changed = false;
     for (const [chatId, user] of Object.entries(users)) {
@@ -92,20 +88,26 @@ function cleanInvalidUsers() {
 // ========== PHÂN TÍCH CẦU ==========
 function analyzeStreak() {
     const predictions = stats.predictions;
-    if (predictions.length < 5) return { breakRate: 0, confidence: 0, streak: 0, pattern: 'Chưa đủ dữ liệu' };
+    if (predictions.length < 5) {
+        return {
+            breakRate: 0,
+            confidence: 0,
+            streak: 0,
+            currentResult: 'chưa có',
+            pattern: 'Chưa đủ dữ liệu',
+            totalPredictions: predictions.length
+        };
+    }
     
-    // Lấy 10 kết quả gần nhất
     const recent = predictions.slice(-10).map(p => p.result);
     const currentResult = recent[recent.length - 1];
     
-    // Tính độ dài chuỗi hiện tại
     let streak = 1;
     for (let i = recent.length - 2; i >= 0; i--) {
         if (recent[i] === currentResult) streak++;
         else break;
     }
     
-    // Tính tỉ lệ bẻ cầu dựa trên lịch sử
     let breaks = 0;
     let totalChanges = 0;
     for (let i = 1; i < predictions.length; i++) {
@@ -116,14 +118,12 @@ function analyzeStreak() {
     }
     const breakRate = totalChanges > 0 ? (breaks / totalChanges) * 100 : 0;
     
-    // Tính độ tin cậy dựa trên độ dài chuỗi
     let confidence = 50;
-    if (streak >= 4) confidence = 35;  // Chuỗi dài, khả năng bẻ cao
+    if (streak >= 4) confidence = 35;
     else if (streak === 3) confidence = 45;
     else if (streak === 2) confidence = 55;
     else if (streak === 1) confidence = 65;
     
-    // Điều chỉnh theo tỉ lệ bẻ lịch sử
     if (breakRate > 60) confidence -= 10;
     if (breakRate < 40) confidence += 10;
     
@@ -132,21 +132,17 @@ function analyzeStreak() {
     return { breakRate: Math.round(breakRate), confidence, streak, currentResult, totalPredictions: predictions.length };
 }
 
-// Hàm cập nhật thống kê dự đoán
 function updateStats(prediction, actual) {
     if (!prediction || !actual) return;
     
-    // Lưu kết quả
     stats.predictions.push({
         time: Date.now(),
         result: actual,
         predicted: prediction
     });
     
-    // Giữ tối đa 1000 kết quả
     if (stats.predictions.length > 1000) stats.predictions.shift();
     
-    // Tính tỉ lệ đúng
     let correctCount = 0;
     for (const p of stats.predictions) {
         if (p.result === p.predicted) correctCount++;
@@ -154,7 +150,6 @@ function updateStats(prediction, actual) {
     stats.total = stats.predictions.length;
     stats.correct = correctCount;
     
-    // Tính tỉ lệ bẻ cầu
     const analysis = analyzeStreak();
     stats.breakRate = analysis.breakRate;
     stats.lastResult = actual;
@@ -162,7 +157,6 @@ function updateStats(prediction, actual) {
     saveStats();
 }
 
-// Hàm tạo tin nhắn dự đoán kèm thống kê
 function formatPredictionMessage(pred) {
     const analysis = analyzeStreak();
     const accuracy = stats.total > 0 ? ((stats.correct / stats.total) * 100).toFixed(1) : 'Chưa có';
@@ -181,7 +175,7 @@ function formatPredictionMessage(pred) {
               `📊 <b>THỐNG KÊ</b>\n` +
               `├ Độ chính xác: <b>${accuracy}%</b> (${stats.correct}/${stats.total})\n` +
               `├ Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n` +
-              `└ Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult || ''}</b>\n\n` +
+              `└ Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult}</b>\n\n` +
               `⚠️ Chỉ tham khảo, không đảm bảo chính xác.`;
     return msg;
 }
@@ -195,8 +189,7 @@ async function sendPrediction(chatId) {
     const msg = formatPredictionMessage(pred);
     bot.sendMessage(chatId, msg, { parse_mode: 'HTML' });
     
-    // Cập nhật thống kê (khi có kết quả thực tế)
-    // Lưu ý: Dự đoán hiện tại là cho phiên tiếp, nhưng ta dùng kết quả phiên này để tính độ chính xác cho dự đoán trước đó
+    // Cập nhật thống kê (so sánh dự đoán trước đó với kết quả hiện tại)
     if (stats.lastPhien && stats.lastPhien !== pred.phien && stats.lastPrediction) {
         updateStats(stats.lastPrediction, pred.ket_qua);
     }
@@ -227,7 +220,7 @@ bot.onText(/\/stats/, (msg) => {
                 `├ Đúng: <b>${stats.correct}</b> / ${stats.total} ván\n\n` +
                 `🔄 Tỉ lệ bẻ cầu: <b>${analysis.breakRate}%</b> (${breakEmoji})\n` +
                 `├ Dựa trên ${analysis.totalPredictions} ván gần nhất\n\n` +
-                `📈 Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult || 'chưa có'}</b>\n` +
+                `📈 Chuỗi hiện tại: <b>${analysis.streak} ${analysis.currentResult}</b>\n` +
                 `├ Độ tin cậy bẻ cầu: <b>${analysis.confidence}%</b>\n\n` +
                 `ℹ️ Cập nhật sau mỗi phiên mới.`;
     
@@ -366,7 +359,6 @@ bot.onText(/\/startbot/, (msg) => {
 });
 
 // ========== LỆNH ADMIN ==========
-
 function parseExpiry(timeStr) {
     if (!timeStr) return null;
     const match = timeStr.match(/^(\d+)(p|h|d|t|th)$/i);
@@ -618,7 +610,7 @@ async function autoSend() {
     if (lastPhien === pred.phien) return;
     lastPhien = pred.phien;
 
-    // Cập nhật thống kê khi có phiên mới
+    // Cập nhật thống kê (so sánh dự đoán trước đó với kết quả hiện tại)
     if (stats.lastPhien && stats.lastPhien !== pred.phien && stats.lastPrediction) {
         updateStats(stats.lastPrediction, pred.ket_qua);
     }
