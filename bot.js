@@ -1,16 +1,6 @@
 /**
  * LC79 Tài Xỉu Bot – Phiên bản Ultimate (11 nâng cấp)
- * - SQLite thay JSON
- * - Cache API
- * - Dự đoán động theo độ chính xác lịch sử
- * - Phân tích cầu nâng cao (RSI)
- * - Dashboard admin web
- * - Backup & báo cáo tự động
- * - Đa ngôn ngữ (vi/en)
- * - Rate limit
- * - Webhook
- * - Stub thanh toán & key dùng thử
- * - Hỗ trợ thêm nguồn API
+ * Đã sửa lỗi SQLITE_ERROR và thứ tự khởi tạo
  */
 
 'use strict';
@@ -21,7 +11,6 @@ const express = require('express');
 const sqlite3 = require('sqlite3').verbose();
 const NodeCache = require('node-cache');
 const i18n = require('i18n');
-const rateLimit = require('express-rate-limit');
 const fs = require('fs');
 const path = require('path');
 const axios = require('axios');
@@ -37,118 +26,135 @@ const CONFIG = {
   DATA_DIR:     './data',
   DB_PATH:      './data/lc79.db',
   BACKUP_DIR:   './backups',
-  AUTO_INTERVAL: 60000,      // 60 giây
-  API_TIMEOUT:   8000,       // 8 giây
-  CACHE_TTL:     10,         // 10 giây cache API
+  AUTO_INTERVAL: 60000,
+  API_TIMEOUT:   8000,
+  CACHE_TTL:     10,
   MAX_HISTORY:   1000,
 };
 
-// Tạo thư mục dữ liệu nếu chưa có
-if (!fs.existsSync(CONFIG.DATA_DIR)) fs.mkdirSync(CONFIG.DATA_DIR);
-if (!fs.existsSync(CONFIG.BACKUP_DIR)) fs.mkdirSync(CONFIG.BACKUP_DIR);
+// Tạo thư mục dữ liệu
+if (!fs.existsSync(CONFIG.DATA_DIR)) fs.mkdirSync(CONFIG.DATA_DIR, { recursive: true });
+if (!fs.existsSync(CONFIG.BACKUP_DIR)) fs.mkdirSync(CONFIG.BACKUP_DIR, { recursive: true });
 
 // ========== CACHE API ==========
 const apiCache = new NodeCache({ stdTTL: CONFIG.CACHE_TTL });
 
 // ========== SQLITE DATABASE ==========
 const db = new sqlite3.Database(CONFIG.DB_PATH);
-const promisify = (fn) => (...args) => new Promise((resolve, reject) => {
-  fn(...args, (err, result) => err ? reject(err) : resolve(result));
-});
+
+// Hàm promisify an toàn
+function promisify(fn) {
+  return function(...args) {
+    return new Promise((resolve, reject) => {
+      fn.call(db, ...args, (err, result) => {
+        if (err) reject(err);
+        else resolve(result);
+      });
+    });
+  };
+}
+
 db.getAsync = promisify(db.get.bind(db));
 db.allAsync = promisify(db.all.bind(db));
 db.runAsync = promisify(db.run.bind(db));
 
-// Khởi tạo bảng
+// Khởi tạo database
 async function initDB() {
-  await db.runAsync(`
-    CREATE TABLE IF NOT EXISTS keys (
-      code TEXT PRIMARY KEY,
-      name TEXT,
-      created INTEGER,
-      expires INTEGER,
-      duration TEXT,
-      usedBy TEXT,
-      createdBy TEXT
-    )
-  `);
-  await db.runAsync(`
-    CREATE TABLE IF NOT EXISTS users (
-      id TEXT PRIMARY KEY,
-      first_name TEXT,
-      last_name TEXT,
-      username TEXT,
-      key TEXT,
-      key_expires INTEGER,
-      source INTEGER DEFAULT 3,
-      auto_on INTEGER DEFAULT 0,
-      activated_at INTEGER,
-      lang TEXT DEFAULT 'vi',
-      rate_limit INTEGER DEFAULT 0
-    )
-  `);
-  await db.runAsync(`
-    CREATE TABLE IF NOT EXISTS stats (
-      user_id TEXT PRIMARY KEY,
-      total INTEGER DEFAULT 0,
-      correct INTEGER DEFAULT 0,
-      break_correct INTEGER DEFAULT 0,
-      last_prediction TEXT,
-      last_actual TEXT
-    )
-  `);
-  await db.runAsync(`
-    CREATE TABLE IF NOT EXISTS history (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      phien INTEGER,
-      actual TEXT,
-      ai_pred TEXT,
-      ai_conf INTEGER,
-      source TEXT,
-      ts INTEGER
-    )
-  `);
-  await db.runAsync(`
-    CREATE TABLE IF NOT EXISTS predictions (
-      user_id TEXT,
-      phien INTEGER,
-      prediction TEXT,
-      confidence INTEGER,
-      source TEXT,
-      ts INTEGER,
-      actual TEXT,
-      correct INTEGER,
-      PRIMARY KEY (user_id, phien)
-    )
-  `);
-  await db.runAsync(`
-    CREATE TABLE IF NOT EXISTS daily_report (
-      date TEXT PRIMARY KEY,
-      new_users INTEGER,
-      total_predictions INTEGER,
-      accuracy REAL,
-      v1_accuracy REAL,
-      v2_accuracy REAL,
-      v3_accuracy REAL
-    )
-  `);
-  console.log('✅ Database initialized');
+  console.log('📦 Initializing database...');
+  try {
+    await db.runAsync(`
+      CREATE TABLE IF NOT EXISTS keys (
+        code TEXT PRIMARY KEY,
+        name TEXT,
+        created INTEGER,
+        expires INTEGER,
+        duration TEXT,
+        usedBy TEXT,
+        createdBy TEXT
+      )
+    `);
+    await db.runAsync(`
+      CREATE TABLE IF NOT EXISTS users (
+        id TEXT PRIMARY KEY,
+        first_name TEXT,
+        last_name TEXT,
+        username TEXT,
+        key TEXT,
+        key_expires INTEGER,
+        source INTEGER DEFAULT 3,
+        auto_on INTEGER DEFAULT 0,
+        activated_at INTEGER,
+        lang TEXT DEFAULT 'vi'
+      )
+    `);
+    await db.runAsync(`
+      CREATE TABLE IF NOT EXISTS stats (
+        user_id TEXT PRIMARY KEY,
+        total INTEGER DEFAULT 0,
+        correct INTEGER DEFAULT 0,
+        break_correct INTEGER DEFAULT 0,
+        last_prediction TEXT,
+        last_actual TEXT
+      )
+    `);
+    await db.runAsync(`
+      CREATE TABLE IF NOT EXISTS history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        phien INTEGER,
+        actual TEXT,
+        ai_pred TEXT,
+        ai_conf INTEGER,
+        source TEXT,
+        ts INTEGER
+      )
+    `);
+    await db.runAsync(`
+      CREATE TABLE IF NOT EXISTS predictions (
+        user_id TEXT,
+        phien INTEGER,
+        prediction TEXT,
+        confidence INTEGER,
+        source TEXT,
+        ts INTEGER,
+        actual TEXT,
+        correct INTEGER,
+        PRIMARY KEY (user_id, phien)
+      )
+    `);
+    await db.runAsync(`
+      CREATE TABLE IF NOT EXISTS daily_report (
+        date TEXT PRIMARY KEY,
+        new_users INTEGER,
+        total_predictions INTEGER,
+        accuracy REAL,
+        v1_accuracy REAL,
+        v2_accuracy REAL,
+        v3_accuracy REAL
+      )
+    `);
+    console.log('✅ Database initialized successfully');
+  } catch (err) {
+    console.error('❌ Database initialization failed:', err.message);
+    throw err;
+  }
 }
-initDB();
 
-// ========== I18N ĐA NGÔN NGỮ ==========
+// ========== I18N ==========
+const localesDir = path.join(__dirname, 'locales');
+if (!fs.existsSync(localesDir)) fs.mkdirSync(localesDir, { recursive: true });
+
 i18n.configure({
   locales: ['vi', 'en'],
-  directory: path.join(__dirname, 'locales'),
+  directory: localesDir,
   defaultLocale: 'vi',
   objectNotation: true,
   updateFiles: false,
 });
+
 // Tạo file ngôn ngữ mẫu nếu chưa có
-const localesDir = path.join(__dirname, 'locales');
-if (!fs.existsSync(localesDir)) fs.mkdirSync(localesDir);
-if (!fs.existsSync(path.join(localesDir, 'vi.json'))) {
-  fs.writeFileSync(path.join(localesDir, 'vi.json'), JSON.stringify({
+const viFile = path.join(localesDir, 'vi.json');
+if (!fs.existsSync(viFile)) {
+  fs.writeFileSync(viFile, JSON.stringify({
     welcome: "🎮 Chào mừng đến LC79 AI Bot!",
     key_expired: "⛔ Key của bạn đã hết hạn!",
     prediction: "DỰ ĐOÁN",
@@ -162,8 +168,9 @@ if (!fs.existsSync(path.join(localesDir, 'vi.json'))) {
     help_admin: "📋 LỆNH ADMIN\n• /addkey tên [thời gian] → Tạo key\n• /delkey MÃ → Xóa key\n• /keys → Danh sách key\n• /users → Danh sách user\n• /info [ID] → Chi tiết user\n• /deluser ID → Xóa user\n• /resetstats → Reset thống kê\n• /admincmds → Danh sách lệnh admin"
   }, null, 2));
 }
-if (!fs.existsSync(path.join(localesDir, 'en.json'))) {
-  fs.writeFileSync(path.join(localesDir, 'en.json'), JSON.stringify({
+const enFile = path.join(localesDir, 'en.json');
+if (!fs.existsSync(enFile)) {
+  fs.writeFileSync(enFile, JSON.stringify({
     welcome: "🎮 Welcome to LC79 AI Bot!",
     key_expired: "⛔ Your key has expired!",
     prediction: "PREDICTION",
@@ -178,7 +185,7 @@ if (!fs.existsSync(path.join(localesDir, 'en.json'))) {
   }, null, 2));
 }
 
-// ========== API & CACHE ==========
+// ========== API FUNCTIONS ==========
 async function apiFetch(url, timeout = CONFIG.API_TIMEOUT) {
   const cached = apiCache.get(url);
   if (cached) return cached;
@@ -209,20 +216,20 @@ async function fetchV1() {
 
   const taiPeople = Number(item.nguoi_cuoc?.tai || 0);
   const xiuPeople = Number(item.nguoi_cuoc?.xiu || 0);
-  const taiMoney  = Number((item.tien_cuoc?.tai || '0').toString().replace(/\./g, ''));
-  const xiuMoney  = Number((item.tien_cuoc?.xiu || '0').toString().replace(/\./g, ''));
-  const phien     = Number(item.phien || 0);
+  const taiMoney = Number((item.tien_cuoc?.tai || '0').toString().replace(/\./g, ''));
+  const xiuMoney = Number((item.tien_cuoc?.xiu || '0').toString().replace(/\./g, ''));
+  const phien = Number(item.phien || 0);
 
   const totalPeople = taiPeople + xiuPeople || 1;
-  const totalMoney  = taiMoney  + xiuMoney  || 1;
+  const totalMoney = taiMoney + xiuMoney || 1;
 
   let score = 0.5;
   if (totalPeople > 0) score += (taiPeople - xiuPeople) / totalPeople * 0.25;
-  if (totalMoney  > 0) score += (taiMoney  - xiuMoney)  / totalMoney  * 0.25;
+  if (totalMoney > 0) score += (taiMoney - xiuMoney) / totalMoney * 0.25;
 
   const pTai = Math.min(0.93, Math.max(0.07, score));
   const result = pTai >= 0.5 ? 'tai' : 'xiu';
-  const conf   = Math.round(Math.max(pTai, 1 - pTai) * 100);
+  const conf = Math.round(Math.max(pTai, 1 - pTai) * 100);
 
   return { source: 'V1', phien, result, conf, pTai, taiPeople, xiuPeople, taiMoney, xiuMoney, raw: item };
 }
@@ -236,7 +243,7 @@ async function fetchV2() {
   const do_tin_cay = Number(item.do_tin_cay || 50);
   const phien = Number(item.phien || 0);
   const ket_qua = item.ket_qua || '';
-  const xuc_xac = [item.xuc_xac_1, item.xuc_xac_2, item.xuc_xac_3].map(v => Number(v));
+  const xuc_xac = [item.xuc_xac_1, item.xuc_xac_2, item.xuc_xac_3].map(v => Number(v) || 0);
   const tong = Number(item.tong || xuc_xac.reduce((a,b)=>a+b,0));
 
   let result = du_doan.toLowerCase();
@@ -252,24 +259,24 @@ async function fetchV2() {
   return { source: 'V2', phien, result, conf: do_tin_cay, actual, dice: xuc_xac, tong, raw: item };
 }
 
-// Học trọng số từ lịch sử
 async function getDynamicWeights() {
-  const hist = await db.allAsync(`
-    SELECT source, COUNT(*) as total,
-           SUM(CASE WHEN actual = ai_pred THEN 1 ELSE 0 END) as correct
-    FROM history
-    WHERE actual IS NOT NULL AND source IN ('V1','V2')
-    GROUP BY source
-  `);
-  const v1 = hist.find(r => r.source === 'V1');
-  const v2 = hist.find(r => r.source === 'V2');
-  const v1Acc = v1 ? v1.correct / v1.total : 0.5;
-  const v2Acc = v2 ? v2.correct / v2.total : 0.5;
-  const total = v1Acc + v2Acc;
-  return {
-    v1Weight: v1Acc / total,
-    v2Weight: v2Acc / total
-  };
+  try {
+    const hist = await db.allAsync(`
+      SELECT source, COUNT(*) as total,
+             SUM(CASE WHEN actual = ai_pred THEN 1 ELSE 0 END) as correct
+      FROM history
+      WHERE actual IS NOT NULL AND source IN ('V1','V2')
+      GROUP BY source
+    `);
+    const v1 = hist.find(r => r.source === 'V1');
+    const v2 = hist.find(r => r.source === 'V2');
+    const v1Acc = v1 ? v1.correct / v1.total : 0.5;
+    const v2Acc = v2 ? v2.correct / v2.total : 0.5;
+    const total = v1Acc + v2Acc;
+    return { v1Weight: v1Acc / total, v2Weight: v2Acc / total };
+  } catch(e) {
+    return { v1Weight: 0.5, v2Weight: 0.5 };
+  }
 }
 
 async function fetchV3Dynamic() {
@@ -288,12 +295,18 @@ async function fetchV3Dynamic() {
   return { ...v1Ok, source: 'V3(Dyn→V1)', dynamicNote: `V1 trọng số ${Math.round(weights.v1Weight*100)}%` };
 }
 
-// Phân tích cầu nâng cao (RSI)
+async function fetchBySource(source) {
+  if (source === 'V1') return fetchV1();
+  if (source === 'V2') return fetchV2();
+  return fetchV3Dynamic();
+}
+
+// ========== HELPER FUNCTIONS ==========
 function advancedBreakAnalysis(history) {
-  if (history.length < 10) return null;
+  if (!history || history.length < 10) return null;
   const seq = history.slice(0, 20).map(h => h.actual === 'tai' ? 1 : 0);
   let gains = 0, losses = 0;
-  for (let i = 1; i < 7; i++) {
+  for (let i = 1; i < Math.min(7, seq.length); i++) {
     const diff = seq[i] - seq[i-1];
     if (diff > 0) gains += diff;
     else losses -= diff;
@@ -304,48 +317,82 @@ function advancedBreakAnalysis(history) {
   return { rsi: Math.round(rsi), signal };
 }
 
-// Lấy thống kê lịch sử
 async function getHistoryStats() {
-  const history = await db.allAsync('SELECT actual, ai_pred FROM history ORDER BY ts DESC LIMIT 1000');
-  if (history.length < 3) return null;
+  try {
+    const history = await db.allAsync('SELECT actual, ai_pred FROM history ORDER BY ts DESC LIMIT 1000');
+    if (history.length < 3) return null;
 
-  const seq = history.filter(h => h.actual).map(h => h.actual);
-  if (seq.length === 0) return null;
+    const seq = history.filter(h => h.actual).map(h => h.actual);
+    if (seq.length === 0) return null;
 
-  const cur = seq[0];
-  let streak = 0;
-  for (const v of seq) if (v === cur) streak++; else break;
+    const cur = seq[0];
+    let streak = 0;
+    for (const v of seq) if (v === cur) streak++; else break;
 
-  let breaks = 0;
-  for (let i = 0; i < seq.length - 1; i++) if (seq[i] !== seq[i+1]) breaks++;
-  const breakRate = breaks / Math.max(seq.length - 1, 1);
+    let breaks = 0;
+    for (let i = 0; i < seq.length - 1; i++) if (seq[i] !== seq[i+1]) breaks++;
+    const breakRate = breaks / Math.max(seq.length - 1, 1);
 
-  const withPred = history.filter(h => h.ai_pred && h.actual);
-  const correct = withPred.filter(h => h.ai_pred === h.actual).length;
-  const accuracy = withPred.length > 0 ? correct / withPred.length : null;
+    const withPred = history.filter(h => h.ai_pred && h.actual);
+    const correct = withPred.filter(h => h.ai_pred === h.actual).length;
+    const accuracy = withPred.length > 0 ? correct / withPred.length : null;
 
-  return { seq, streak, streakVal: cur, breakRate, accuracy, total: history.length };
-}
-
-// Cập nhật lịch sử
-async function updateHistory(phien, actual, aiPred, aiConf, source) {
-  const existing = await db.getAsync('SELECT 1 FROM history WHERE phien = ?', phien);
-  if (existing) return;
-
-  await db.runAsync(
-    `INSERT INTO history (phien, actual, ai_pred, ai_conf, source, ts)
-     VALUES (?, ?, ?, ?, ?, ?)`,
-    phien, actual, aiPred, aiConf, source, Date.now()
-  );
-
-  // Giữ tối đa MAX_HISTORY
-  const count = await db.getAsync('SELECT COUNT(*) as c FROM history');
-  if (count.c > CONFIG.MAX_HISTORY) {
-    await db.runAsync(`DELETE FROM history WHERE id IN (SELECT id FROM history ORDER BY ts ASC LIMIT ?)`, count.c - CONFIG.MAX_HISTORY);
+    return { seq, streak, streakVal: cur, breakRate, accuracy, total: history.length };
+  } catch(e) {
+    return null;
   }
 }
 
-// Format tin nhắn dự đoán
+async function updateHistory(phien, actual, aiPred, aiConf, source) {
+  try {
+    const existing = await db.getAsync('SELECT 1 FROM history WHERE phien = ?', phien);
+    if (existing) return;
+
+    await db.runAsync(
+      `INSERT INTO history (phien, actual, ai_pred, ai_conf, source, ts)
+       VALUES (?, ?, ?, ?, ?, ?)`,
+      phien, actual, aiPred, aiConf, source, Date.now()
+    );
+
+    const count = await db.getAsync('SELECT COUNT(*) as c FROM history');
+    if (count.c > CONFIG.MAX_HISTORY) {
+      await db.runAsync(`DELETE FROM history WHERE id IN (SELECT id FROM history ORDER BY ts ASC LIMIT ?)`, count.c - CONFIG.MAX_HISTORY);
+    }
+  } catch(e) {
+    console.error('Update history error:', e.message);
+  }
+}
+
+function formatDuration(ms) {
+  if (!ms) return '0 giây';
+  const s = ms / 1000;
+  if (s < 60) return `${s.toFixed(0)} giây`;
+  if (s < 3600) return `${(s/60).toFixed(0)} phút`;
+  if (s < 86400) return `${(s/3600).toFixed(1)} giờ`;
+  if (s < 2592000) return `${(s/86400).toFixed(1)} ngày`;
+  return `${(s/2592000).toFixed(1)} tháng`;
+}
+
+function formatExpiry(exp) {
+  if (!exp) return 'Không giới hạn';
+  const diff = exp - Date.now();
+  if (diff <= 0) return '⛔ Đã hết hạn';
+  return `⏳ Còn ${formatDuration(diff)}`;
+}
+
+function parseDuration(str) {
+  if (!str) return 30 * 24 * 60 * 60 * 1000;
+  str = str.toLowerCase().trim();
+  const num = parseFloat(str);
+  if (isNaN(num)) return null;
+  if (str.endsWith('th')) return num * 30 * 24 * 60 * 60 * 1000;
+  if (str.endsWith('t')) return num * 7 * 24 * 60 * 60 * 1000;
+  if (str.endsWith('d')) return num * 24 * 60 * 60 * 1000;
+  if (str.endsWith('h')) return num * 60 * 60 * 1000;
+  if (str.endsWith('p')) return num * 60 * 1000;
+  return null;
+}
+
 function formatPrediction(data, histStats, userStats, breakAnalysis, lang = 'vi') {
   i18n.setLocale(lang);
   const isTai = data.result === 'tai';
@@ -362,7 +409,7 @@ function formatPrediction(data, histStats, userStats, breakAnalysis, lang = 'vi'
   if (data.phien) msg += `║ Phiên: <b>${data.phien}</b>\n`;
 
   if (data.dice && data.dice[0]) {
-    const diceStr = data.dice.map(d => ['⚀','⚁','⚂','⚃','⚄','⚅'][d-1]).join(' ');
+    const diceStr = data.dice.map(d => ['⚀','⚁','⚂','⚃','⚄','⚅'][d-1] || '?').join(' ');
     msg += `╠══ Phiên vừa xong ══\n`;
     msg += `║ 🎲 ${diceStr} = <b>${data.tong}</b>\n`;
     if (data.actual) {
@@ -414,37 +461,16 @@ function formatPrediction(data, histStats, userStats, breakAnalysis, lang = 'vi'
   return msg;
 }
 
-// ========== RATE LIMIT ==========
-const commandCache = new NodeCache({ stdTTL: 60 }); // 1 phút
-
-// ========== BACKUP & BÁO CÁO ==========
+// ========== BACKUP & WEBHOOK ==========
 function backupDatabase() {
-  const src = CONFIG.DB_PATH;
-  const dest = path.join(CONFIG.BACKUP_DIR, `lc79_${new Date().toISOString().slice(0,10)}.db`);
-  fs.copyFileSync(src, dest);
-  console.log(`📁 Backup created: ${dest}`);
-}
-async function sendDailyReport() {
-  const today = new Date().toISOString().slice(0,10);
-  const stats = await db.getAsync(`
-    SELECT COUNT(DISTINCT user_id) as newUsers,
-           COUNT(*) as predictions,
-           AVG(CASE WHEN correct = 1 THEN 1 ELSE 0 END) as accuracy
-    FROM predictions WHERE DATE(ts, 'unixepoch') = ?
-  `, today);
-  if (!stats) return;
-  const msg = `📊 Báo cáo ngày ${today}:\n- User mới: ${stats.newUsers}\n- Dự đoán: ${stats.predictions}\n- Độ chính xác: ${(stats.accuracy*100).toFixed(1)}%`;
   try {
-    await bot.sendMessage(CONFIG.ADMIN_ID, msg);
+    const src = CONFIG.DB_PATH;
+    const dest = path.join(CONFIG.BACKUP_DIR, `lc79_${new Date().toISOString().slice(0,10)}.db`);
+    fs.copyFileSync(src, dest);
+    console.log(`📁 Backup created: ${dest}`);
   } catch(e) {}
 }
-// Backup mỗi ngày và báo cáo
-setInterval(() => {
-  backupDatabase();
-  sendDailyReport();
-}, 24 * 60 * 60 * 1000);
 
-// ========== WEBHOOK (nếu có) ==========
 async function sendWebhook(data) {
   if (!CONFIG.WEBHOOK_URL) return;
   try {
@@ -452,20 +478,87 @@ async function sendWebhook(data) {
   } catch(e) {}
 }
 
-// ========== KHỞI TẠO BOT ==========
+// ========== RATE LIMIT ==========
+const commandCache = new NodeCache({ stdTTL: 60 });
+
+// ========== AUTO SEND ==========
+const autoTimers = {};
+
+async function startUserAuto(uid) {
+  if (autoTimers[uid]) clearInterval(autoTimers[uid]);
+  autoTimers[uid] = setInterval(async () => {
+    try {
+      const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
+      if (!user || !user.auto_on) {
+        stopUserAuto(uid);
+        return;
+      }
+      if (user.key_expires < Date.now()) {
+        stopUserAuto(uid);
+        await db.runAsync('UPDATE users SET auto_on = 0 WHERE id = ?', uid);
+        bot.sendMessage(uid, '⛔ Key của bạn đã hết hạn! Auto đã tắt.', { parse_mode: 'HTML' });
+        return;
+      }
+
+      const source = `V${user.source || 3}`;
+      const data = await fetchBySource(source);
+
+      if (data.phien && data.actual) {
+        await updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
+      }
+      const histStats = await getHistoryStats();
+      const historyForBreak = await db.allAsync('SELECT actual FROM history ORDER BY ts DESC LIMIT 20');
+      const breakAnalysis = advancedBreakAnalysis(historyForBreak);
+      const userStats = await db.getAsync('SELECT total, correct FROM stats WHERE user_id = ?', uid);
+      const msgText = formatPrediction(data, histStats, userStats, breakAnalysis, user.lang);
+      bot.sendMessage(uid, msgText, { parse_mode: 'HTML' });
+
+      await db.runAsync(
+        `INSERT INTO predictions (user_id, phien, prediction, confidence, source, ts)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+        uid, data.phien, data.result, data.conf, data.source, Date.now()
+      );
+    } catch(e) {
+      console.error(`Auto send error for ${uid}:`, e.message);
+    }
+  }, CONFIG.AUTO_INTERVAL);
+}
+
+function stopUserAuto(uid) {
+  if (autoTimers[uid]) {
+    clearInterval(autoTimers[uid]);
+    delete autoTimers[uid];
+  }
+}
+
+async function restoreAutoUsers() {
+  try {
+    const users = await db.allAsync('SELECT id FROM users WHERE auto_on = 1 AND key_expires > ?', Date.now());
+    for (const u of users) startUserAuto(u.id);
+    console.log(`Restored auto for ${users.length} users`);
+  } catch(e) {
+    console.error('Restore auto users error:', e.message);
+  }
+}
+
+// ========== BOT INSTANCE ==========
 const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
 bot.on('polling_error', e => console.error('Polling error:', e.message));
 bot.on('error', e => console.error('Bot error:', e.message));
 
-// ========== LỆNH USER ==========
+// ========== USER COMMANDS ==========
 async function checkActive(uid, msg) {
-  const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
-  if (!user || user.key_expires < Date.now()) {
-    const lang = user?.lang || 'vi';
-    bot.sendMessage(uid, i18n.__({phrase: 'not_activated', locale: lang}), { parse_mode: 'HTML' });
+  try {
+    const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
+    if (!user || user.key_expires < Date.now()) {
+      const lang = user?.lang || 'vi';
+      bot.sendMessage(uid, i18n.__({phrase: 'not_activated', locale: lang}), { parse_mode: 'HTML' });
+      return false;
+    }
+    return user;
+  } catch(e) {
     return false;
   }
-  return user;
 }
 
 bot.onText(/\/start/, async (msg) => {
@@ -474,8 +567,7 @@ bot.onText(/\/start/, async (msg) => {
   const lang = user?.lang || 'vi';
   i18n.setLocale(lang);
   if (user && user.key_expires > Date.now()) {
-    const text = i18n.__('welcome') + `\n\n✅ ` + i18n.__('activated') + `\n⏰ Hết hạn: ${formatExpiry(user.key_expires)}\n\n` + i18n.__('help_user');
-    bot.sendMessage(uid, text, { parse_mode: 'HTML' });
+    bot.sendMessage(uid, i18n.__('welcome') + `\n\n✅ ` + i18n.__('activated') + `\n⏰ Hết hạn: ${formatExpiry(user.key_expires)}\n\n` + i18n.__('help_user'), { parse_mode: 'HTML' });
   } else {
     bot.sendMessage(uid, i18n.__('welcome') + '\n\n' + i18n.__('help_user'), { parse_mode: 'HTML' });
   }
@@ -498,9 +590,7 @@ bot.onText(/\/key\s+(.+)/, async (msg, match) => {
     return;
   }
 
-  // Cập nhật key
   await db.runAsync('UPDATE keys SET usedBy = ? WHERE code = ?', uid, code);
-  // Lưu user
   const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
   const lang = user?.lang || 'vi';
   await db.runAsync(
@@ -511,7 +601,6 @@ bot.onText(/\/key\s+(.+)/, async (msg, match) => {
   );
 
   bot.sendMessage(uid, `✅ <b>Kích hoạt thành công!</b>\n\n🔑 Key: <code>${code}</code>\n⏰ Hạn: ${formatExpiry(keyData.expires)}\n\n📡 Nguồn mặc định: V3 (Thông minh)`, { parse_mode: 'HTML' });
-  // Thông báo admin
   try {
     await bot.sendMessage(CONFIG.ADMIN_ID,
       `🔔 User mới kích hoạt key!\n👤 ${msg.from.first_name || ''} ${msg.from.last_name || ''} (@${msg.from.username || 'N/A'})\n🆔 ID: ${uid}\n🔑 Key: <code>${code}</code>\n⏰ Hạn: ${formatExpiry(keyData.expires)}`,
@@ -535,15 +624,12 @@ bot.onText(/\/now/, async (msg) => {
   const source = `V${user.source || 3}`;
   let data;
   try {
-    if (source === 'V1') data = await fetchV1();
-    else if (source === 'V2') data = await fetchV2();
-    else data = await fetchV3Dynamic();
+    data = await fetchBySource(source);
   } catch(e) {
     bot.sendMessage(uid, i18n.__({phrase: 'error_api', locale: user.lang}), { parse_mode: 'HTML' });
     return;
   }
 
-  // Cập nhật lịch sử nếu có actual
   if (data.phien && data.actual) {
     await updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
   }
@@ -554,7 +640,6 @@ bot.onText(/\/now/, async (msg) => {
   const userStats = await db.getAsync('SELECT total, correct FROM stats WHERE user_id = ?', uid);
   const msgText = formatPrediction(data, histStats, userStats, breakAnalysis, user.lang);
   bot.sendMessage(uid, msgText, { parse_mode: 'HTML' });
-  // Lưu dự đoán vào bảng predictions
   await db.runAsync(
     `INSERT INTO predictions (user_id, phien, prediction, confidence, source, ts) VALUES (?, ?, ?, ?, ?, ?)`,
     uid, data.phien, data.result, data.conf, data.source, Date.now()
@@ -631,7 +716,7 @@ bot.onText(/\/help/, async (msg) => {
   bot.sendMessage(uid, text, { parse_mode: 'HTML' });
 });
 
-// ========== LỆNH ADMIN ==========
+// ========== ADMIN COMMANDS ==========
 function requireAdmin(msg, fn) {
   if (String(msg.chat.id) !== CONFIG.ADMIN_ID) {
     bot.sendMessage(msg.chat.id, '❌ Lệnh này chỉ dành cho admin.');
@@ -674,7 +759,6 @@ bot.onText(/\/delkey\s+(.+)/, (msg, match) => requireAdmin(msg, async () => {
     return;
   }
   await db.runAsync('DELETE FROM keys WHERE code = ?', code);
-  // Giải phóng user nếu đang dùng key này
   await db.runAsync('UPDATE users SET key = NULL, key_expires = NULL, auto_on = 0 WHERE key = ?', code);
   bot.sendMessage(msg.chat.id, `✅ Đã xóa key <code>${code}</code> (${key.name})`, { parse_mode: 'HTML' });
 }));
@@ -745,7 +829,6 @@ bot.onText(/\/deluser\s+(\d+)/, (msg, match) => requireAdmin(msg, async () => {
   }
   stopUserAuto(uid);
   await db.runAsync('DELETE FROM users WHERE id = ?', uid);
-  // Giải phóng key
   if (user.key) {
     await db.runAsync('UPDATE keys SET usedBy = NULL WHERE code = ?', user.key);
   }
@@ -762,124 +845,54 @@ bot.onText(/\/resetstats/, (msg) => requireAdmin(msg, async () => {
   bot.sendMessage(msg.chat.id, '✅ Đã reset toàn bộ thống kê và lịch sử.');
 }));
 
-// ========== AUTO SEND ==========
-const autoTimers = {};
-
-async function startUserAuto(uid) {
-  if (autoTimers[uid]) clearInterval(autoTimers[uid]);
-  autoTimers[uid] = setInterval(async () => {
-    const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
-    if (!user || !user.auto_on) {
-      stopUserAuto(uid);
-      return;
-    }
-    if (user.key_expires < Date.now()) {
-      stopUserAuto(uid);
-      await db.runAsync('UPDATE users SET auto_on = 0 WHERE id = ?', uid);
-      bot.sendMessage(uid, '⛔ Key của bạn đã hết hạn! Auto đã tắt.', { parse_mode: 'HTML' });
-      return;
-    }
-
-    const source = `V${user.source || 3}`;
-    let data;
-    try {
-      if (source === 'V1') data = await fetchV1();
-      else if (source === 'V2') data = await fetchV2();
-      else data = await fetchV3Dynamic();
-    } catch(e) {
-      console.error(`Auto send error for ${uid}:`, e.message);
-      return;
-    }
-
-    if (data.phien && data.actual) {
-      await updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
-    }
-    const histStats = await getHistoryStats();
-    const historyForBreak = await db.allAsync('SELECT actual FROM history ORDER BY ts DESC LIMIT 20');
-    const breakAnalysis = advancedBreakAnalysis(historyForBreak);
-    const userStats = await db.getAsync('SELECT total, correct FROM stats WHERE user_id = ?', uid);
-    const msgText = formatPrediction(data, histStats, userStats, breakAnalysis, user.lang);
-    bot.sendMessage(uid, msgText, { parse_mode: 'HTML' });
-    // Lưu dự đoán
-    await db.runAsync(
-      `INSERT INTO predictions (user_id, phien, prediction, confidence, source, ts) VALUES (?, ?, ?, ?, ?, ?)`,
-      uid, data.phien, data.result, data.conf, data.source, Date.now()
-    );
-  }, CONFIG.AUTO_INTERVAL);
-}
-
-function stopUserAuto(uid) {
-  if (autoTimers[uid]) {
-    clearInterval(autoTimers[uid]);
-    delete autoTimers[uid];
-  }
-}
-
-async function restoreAutoUsers() {
-  const users = await db.allAsync('SELECT id FROM users WHERE auto_on = 1 AND key_expires > ?', Date.now());
-  for (const u of users) startUserAuto(u.id);
-  console.log(`Restored auto for ${users.length} users`);
-}
-
-// ========== TIỆN ÍCH ==========
-function parseDuration(str) {
-  if (!str) return 30 * 24 * 60 * 60 * 1000;
-  str = str.toLowerCase().trim();
-  const num = parseFloat(str);
-  if (isNaN(num)) return null;
-  if (str.endsWith('th')) return num * 30 * 24 * 60 * 60 * 1000;
-  if (str.endsWith('t'))  return num * 7  * 24 * 60 * 60 * 1000;
-  if (str.endsWith('d'))  return num * 24 * 60 * 60 * 1000;
-  if (str.endsWith('h'))  return num * 60 * 60 * 1000;
-  if (str.endsWith('p'))  return num * 60 * 1000;
-  return null;
-}
-
-function formatDuration(ms) {
-  const s = ms / 1000;
-  if (s < 60)          return `${s.toFixed(0)} giây`;
-  if (s < 3600)        return `${(s/60).toFixed(0)} phút`;
-  if (s < 86400)       return `${(s/3600).toFixed(1)} giờ`;
-  if (s < 2592000)     return `${(s/86400).toFixed(1)} ngày`;
-  return `${(s/2592000).toFixed(1)} tháng`;
-}
-
-function formatExpiry(exp) {
-  if (!exp) return 'Không giới hạn';
-  const diff = exp - Date.now();
-  if (diff <= 0) return '⛔ Đã hết hạn';
-  return `⏳ Còn ${formatDuration(diff)}`;
-}
-
-// ========== WEB DASHBOARD ==========
+// ========== EXPRESS SERVER ==========
 const app = express();
 app.use(express.json());
 app.get('/', (req, res) => res.send('Bot đang chạy!'));
 app.get('/dashboard', async (req, res) => {
-  const users = await db.allAsync('SELECT id, first_name, username, key, key_expires, source, auto_on FROM users');
-  const keys = await db.allAsync('SELECT code, name, expires, usedBy FROM keys');
-  const stats = await db.getAsync('SELECT COUNT(*) as total, SUM(correct) as correct FROM stats');
-  const html = `
-  <!DOCTYPE html>
-  <html>
-  <head><meta charset="UTF-8"><title>LC79 Dashboard</title><style>body{font-family:monospace;background:#0a0c14;color:#eee;padding:20px;} table{border-collapse:collapse;width:100%;} th,td{border:1px solid #2a3a5e;padding:8px;text-align:left;} th{background:#1e2a45;}</style></head>
-  <body><h1>📊 LC79 Admin Dashboard</h1>
-  <h2>Users (${users.length})</h2>
-  <table><tr><th>ID</th><th>Name</th><th>Username</th><th>Key</th><th>Expiry</th><th>Source</th><th>Auto</th></tr>
-  ${users.map(u => `<tr><td>${u.id}</td><td>${u.first_name||''}</td><td>${u.username||''}</td><td>${u.key||''}</td><td>${u.key_expires ? new Date(u.key_expires).toLocaleString('vi') : '∞'}</td><td>V${u.source||3}</td><td>${u.auto_on?'✅':'⏹'}</td></tr>`).join('')}
-  </table>
-  <h2>Keys (${keys.length})</h2>
-  <table><tr><th>Code</th><th>Name</th><th>Expires</th><th>UsedBy</th></tr>
-  ${keys.map(k => `<tr><td>${k.code}</td><td>${k.name}</td><td>${k.expires ? new Date(k.expires).toLocaleString('vi') : '∞'}</td><td>${k.usedBy||''}</td></tr>`).join('')}
-  </table>
-  <h2>Stats</h2>
-  <p>Total predictions: ${stats?.total||0}<br>Correct: ${stats?.correct||0} (${stats?.total ? (stats.correct/stats.total*100).toFixed(1) : 0}%)</p>
-  </body></html>`;
-  res.send(html);
+  try {
+    const users = await db.allAsync('SELECT id, first_name, username, key, key_expires, source, auto_on FROM users');
+    const keys = await db.allAsync('SELECT code, name, expires, usedBy FROM keys');
+    const stats = await db.getAsync('SELECT COUNT(*) as total, SUM(correct) as correct FROM stats');
+    const html = `
+    <!DOCTYPE html>
+    <html>
+    <head><meta charset="UTF-8"><title>LC79 Dashboard</title><style>
+      body{font-family:monospace;background:#0a0c14;color:#eee;padding:20px;}
+      table{border-collapse:collapse;width:100%;}
+      th,td{border:1px solid #2a3a5e;padding:8px;text-align:left;}
+      th{background:#1e2a45;}
+    </style></head>
+    <body><h1>📊 LC79 Admin Dashboard</h1>
+    <h2>Users (${users.length})</h2>
+    <table><tr><th>ID</th><th>Name</th><th>Username</th><th>Key</th><th>Expiry</th><th>Source</th><th>Auto</th></tr>
+    ${users.map(u => `<tr><td>${u.id}</td><td>${u.first_name||''}</td><td>${u.username||''}</td><td>${u.key||''}</td><td>${u.key_expires ? new Date(u.key_expires).toLocaleString('vi') : '∞'}</td><td>V${u.source||3}</td><td>${u.auto_on?'✅':'⏹'}</td></tr>`).join('')}
+    </table>
+    <h2>Keys (${keys.length})</h2>
+    <table><tr><th>Code</th><th>Name</th><th>Expires</th><th>UsedBy</th></tr>
+    ${keys.map(k => `<tr><td>${k.code}</td><td>${k.name}</td><td>${k.expires ? new Date(k.expires).toLocaleString('vi') : '∞'}</td><td>${k.usedBy||''}</td></tr>`).join('')}
+    </table>
+    <h2>Stats</h2>
+    <p>Total predictions: ${stats?.total||0}<br>Correct: ${stats?.correct||0} (${stats?.total ? (stats.correct/stats.total*100).toFixed(1) : 0}%)</p>
+    </body></html>`;
+    res.send(html);
+  } catch(e) {
+    res.status(500).send('Error loading dashboard');
+  }
 });
 app.listen(CONFIG.PORT, () => console.log(`🌐 Web dashboard at http://localhost:${CONFIG.PORT}/dashboard`));
 
-// ========== KHỞI CHẠY ==========
-restoreAutoUsers();
-console.log('✅ Bot đã khởi động thành công!');
-bot.sendMessage(CONFIG.ADMIN_ID, `🟢 <b>Bot LC79 đã online!</b>`, { parse_mode: 'HTML' }).catch(e => console.log(e));
+// ========== KHỞI ĐỘNG ==========
+(async () => {
+  try {
+    await initDB();
+    await restoreAutoUsers();
+    console.log('✅ Bot đã khởi động thành công!');
+    await bot.sendMessage(CONFIG.ADMIN_ID, `🟢 <b>Bot LC79 đã online!</b>`, { parse_mode: 'HTML' }).catch(e => console.log(e));
+  } catch(err) {
+    console.error('❌ Failed to start bot:', err);
+  }
+})();
+
+// Backup hàng ngày
+setInterval(() => backupDatabase(), 24 * 60 * 60 * 1000);
