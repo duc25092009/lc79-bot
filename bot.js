@@ -831,6 +831,14 @@ function backupDatabase() {
 }
 setInterval(backupDatabase, 24 * 60 * 60 * 1000);
 
-restoreAutoUsers();
-console.log('✅ Bot đã khởi động thành công!');
-bot.sendMessage(CONFIG.ADMIN_ID, `🟢 <b>Bot LC79 đã online!</b>`, { parse_mode: 'HTML' }).catch(()=>{});
+// Khởi động bot sau khi DB đã sẵn sàng
+(async () => {
+  try {
+    await initDB();               // Đợi tạo bảng xong
+    await restoreAutoUsers();     // Sau đó mới khôi phục auto users
+    console.log('✅ Bot đã khởi động thành công!');
+    await bot.sendMessage(CONFIG.ADMIN_ID, `🟢 <b>Bot LC79 đã online!</b>`, { parse_mode: 'HTML' }).catch(()=>{});
+  } catch (err) {
+    console.error('❌ Failed to start bot:', err);
+  }
+})();
