@@ -1,7 +1,5 @@
 /**
- * LC79 Tài Xỉu Prediction Bot
- * Node.js + Telegram Bot API
- * Deploy: Render.com
+ * LC79 Tài Xỉu Prediction Bot – Phân tích cầu nâng cao + học bẻ cầu
  */
 
 'use strict';
@@ -30,7 +28,11 @@ const CONFIG = {
   USERS_FILE:  './data/users.json',
   STATS_FILE:  './data/stats.json',
   HISTORY_FILE:'./data/history.json',
+  BREAK_FILE:  './data/break_learning.json',  // Học từ các lần bẻ cầu
 };
+
+// Tạo thư mục data
+if (!fs.existsSync('./data')) fs.mkdirSync('./data');
 
 // ═══════════════════════════════════════════════════════
 //  LOGGER
@@ -46,8 +48,6 @@ const log = {
 // ═══════════════════════════════════════════════════════
 //  DATA LAYER — JSON
 // ═══════════════════════════════════════════════════════
-if (!fs.existsSync('./data')) fs.mkdirSync('./data');
-
 function readJSON(file, def = {}) {
   try {
     if (!fs.existsSync(file)) { writeJSON(file, def); return def; }
@@ -64,10 +64,12 @@ const DB = {
   get users()   { return readJSON(CONFIG.USERS_FILE,   {}); },
   get stats()   { return readJSON(CONFIG.STATS_FILE,   {}); },
   get history() { return readJSON(CONFIG.HISTORY_FILE, []); },
+  get breakLearning() { return readJSON(CONFIG.BREAK_FILE, { breakCount: 0, successCount: 0, lastBreak: null, breakPatterns: {} }); },
   saveKeys(d)    { writeJSON(CONFIG.KEYS_FILE,    d); },
   saveUsers(d)   { writeJSON(CONFIG.USERS_FILE,   d); },
   saveStats(d)   { writeJSON(CONFIG.STATS_FILE,   d); },
   saveHistory(d) { writeJSON(CONFIG.HISTORY_FILE, d); },
+  saveBreakLearning(d) { writeJSON(CONFIG.BREAK_FILE, d); },
 };
 
 // ═══════════════════════════════════════════════════════
@@ -103,7 +105,7 @@ function formatExpiry(exp) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  API HELPERS (dùng fetch native, không cần node-fetch)
+//  API HELPERS
 // ═══════════════════════════════════════════════════════
 async function apiFetch(url, timeout = CONFIG.API_TIMEOUT) {
   const proxies = ['https://api.allorigins.win/raw?url=', 'https://corsproxy.io/?', ''];
@@ -121,92 +123,78 @@ async function apiFetch(url, timeout = CONFIG.API_TIMEOUT) {
   throw new Error('All proxies failed');
 }
 
+// V1: Dự đoán dựa trên dữ liệu cược
 async function fetchV1() {
   const data = await apiFetch(CONFIG.API_V1);
   const item = Array.isArray(data) ? data[0] : (data.data || data);
   if (!item) throw new Error('V1: empty');
 
-  const taiPeople = Number(item.tai_count || item.taiCount || item.nguoi_cuoc?.tai || 0);
-  const xiuPeople = Number(item.xiu_count || item.xiuCount || item.nguoi_cuoc?.xiu || 0);
-  const taiMoney = Number((item.tai_money || item.taiMoney || item.tien_cuoc?.tai || '0').toString().replace(/\./g, ''));
-  const xiuMoney = Number((item.xiu_money || item.xiuMoney || item.tien_cuoc?.xiu || '0').toString().replace(/\./g, ''));
-  const phien = Number(item.phien || item.session || 0);
+  const taiPeople = Number(item.nguoi_cuoc?.tai || item.tai_count || 0);
+  const xiuPeople = Number(item.nguoi_cuoc?.xiu || item.xiu_count || 0);
+  const taiMoney = Number((item.tien_cuoc?.tai || item.tai_money || '0').toString().replace(/\./g, ''));
+  const xiuMoney = Number((item.tien_cuoc?.xiu || item.xiu_money || '0').toString().replace(/\./g, ''));
+  const phien = Number(item.phien || 0);
+  const nextPhien = phien + 1;
 
   const totalPeople = taiPeople + xiuPeople || 1;
   const totalMoney = taiMoney + xiuMoney || 1;
 
-  const pTai = 0.5
-    + (taiPeople - xiuPeople) / totalPeople * 0.25
-    + (taiMoney - xiuMoney) / totalMoney * 0.25;
+  let score = 0.5;
+  if (totalPeople > 0) score += (taiPeople - xiuPeople) / totalPeople * 0.25;
+  if (totalMoney > 0) score += (taiMoney - xiuMoney) / totalMoney * 0.25;
 
-  const clampedP = Math.min(0.93, Math.max(0.07, pTai));
+  const clampedP = Math.min(0.93, Math.max(0.07, score));
   const result = clampedP >= 0.5 ? 'tai' : 'xiu';
   const conf = Math.round(Math.max(clampedP, 1 - clampedP) * 100);
 
+  const dice = [item.xuc_xac_1, item.xuc_xac_2, item.xuc_xac_3];
+  const tong = item.tong || dice.reduce((a,b)=>a+b,0);
+  const actual = item.ket_qua || '';
+
   return {
     source: 'V1',
-    phien,
-    result,
-    conf,
+    phien, nextPhien, result, conf, dice, tong, actual,
     taiPeople, xiuPeople, taiMoney, xiuMoney,
-    raw: item,
   };
 }
 
+// V2: Dự đoán từ API LC79
 async function fetchV2() {
   const data = await apiFetch(CONFIG.API_V2);
   const item = Array.isArray(data) ? data[0] : (data.data || data);
   if (!item) throw new Error('V2: empty');
 
-  const du_doan = item.du_doan || item.prediction || '';
-  const do_tin_cay = Number(item.do_tin_cay || item.confidence || 50);
+  const du_doan = item.du_doan || '';
+  const do_tin_cay = Number(item.do_tin_cay || 50);
   const phien = Number(item.phien || 0);
-  const ket_qua = item.ket_qua || '';
+  const nextPhien = item.phien_hien_tai || (phien + 1);
+  const actual = item.ket_qua || '';
 
   let result = du_doan.toLowerCase();
   if (result.includes('tài') || result === 'tai') result = 'tai';
   else if (result.includes('xỉu') || result === 'xiu') result = 'xiu';
   else result = null;
 
-  let actual = ket_qua.toLowerCase();
-  if (actual.includes('tài') || actual === 'tai') actual = 'tai';
-  else if (actual.includes('xỉu') || actual === 'xiu') actual = 'xiu';
-  else actual = null;
+  const dice = [item.xuc_xac_1, item.xuc_xac_2, item.xuc_xac_3];
+  const tong = item.tong || dice.reduce((a,b)=>a+b,0);
 
-  const dice = [
-    Number(item.xuc_xac_1 || item.d1 || 0),
-    Number(item.xuc_xac_2 || item.d2 || 0),
-    Number(item.xuc_xac_3 || item.d3 || 0),
-  ];
-  const tong = Number(item.tong || dice.reduce((a,b)=>a+b,0));
-
-  return {
-    source: 'V2',
-    phien,
-    result,
-    conf: do_tin_cay,
-    actual,
-    dice,
-    tong,
-    raw: item,
-  };
+  return { source: 'V2', phien, nextPhien, result, conf: do_tin_cay, dice, tong, actual };
 }
 
+// V3: Kết hợp V1 và V2 (ưu tiên V2 nếu độ tin cậy >= 60%)
 async function fetchV3() {
-  const [v1Res, v2Res] = await Promise.allSettled([fetchV1(), fetchV2()]);
-  const v1 = v1Res.status === 'fulfilled' ? v1Res.value : null;
-  const v2 = v2Res.status === 'fulfilled' ? v2Res.value : null;
+  const [v1, v2] = await Promise.allSettled([fetchV1(), fetchV2()]);
+  const v1Ok = v1.status === 'fulfilled' ? v1.value : null;
+  const v2Ok = v2.status === 'fulfilled' ? v2.value : null;
 
-  if (v2 && v2.conf >= 60) {
-    return { ...v2, source: 'V3(→V2)' };
+  if (!v1Ok && !v2Ok) throw new Error('Cả V1 và V2 đều thất bại');
+  if (!v1Ok) return { ...v2Ok, source: 'V3(→V2)' };
+  if (!v2Ok) return { ...v1Ok, source: 'V3(→V1)' };
+
+  if (v2Ok.result && v2Ok.conf >= 60) {
+    return { ...v2Ok, source: 'V3(→V2)' };
   }
-  if (v1) {
-    return { ...v1, source: 'V3(→V1)' };
-  }
-  if (v2) {
-    return { ...v2, source: 'V3(→V2)' };
-  }
-  throw new Error('Cả V1 và V2 đều thất bại');
+  return { ...v1Ok, source: 'V3(→V1)' };
 }
 
 async function fetchBySource(source) {
@@ -218,8 +206,85 @@ async function fetchBySource(source) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  HISTORY & STATS
+//  PHÂN TÍCH CẦU & HỌC BẺ CẦU
 // ═══════════════════════════════════════════════════════
+function analyzeStreak(history) {
+  if (history.length < 3) return null;
+
+  const seq = history.filter(h => h.actual).map(h => h.actual);
+  if (seq.length === 0) return null;
+
+  const cur = seq[0];
+  let streak = 0;
+  for (const v of seq) { if (v === cur) streak++; else break; }
+
+  let breaks = 0;
+  for (let i = 0; i < seq.length - 1; i++) if (seq[i] !== seq[i+1]) breaks++;
+  const breakRate = seq.length > 1 ? (breaks / (seq.length - 1)) * 100 : 0;
+
+  // Học từ dữ liệu bẻ cầu
+  const breakLearning = DB.breakLearning;
+  let breakConfidence = 50;
+
+  // Nếu đã từng bẻ cầu thành công ở độ dài chuỗi tương tự
+  if (breakLearning.breakPatterns && breakLearning.breakPatterns[streak]) {
+    const pattern = breakLearning.breakPatterns[streak];
+    const successRate = pattern.success / pattern.total;
+    breakConfidence = 50 + Math.round(successRate * 40);
+  }
+
+  // Cảnh báo bẻ cầu khi chuỗi >= 4
+  const breakWarning = streak >= 4;
+  const breakSuggestion = breakWarning ? (cur === 'tai' ? 'XỈU' : 'TÀI') : null;
+
+  return { streak, streakVal: cur, breakRate, breakWarning, breakSuggestion, breakConfidence, total: seq.length };
+}
+
+// Cập nhật học bẻ cầu (gọi khi dự đoán bẻ cầu đúng)
+function updateBreakLearning(streakLen, isSuccess) {
+  const breakLearning = DB.breakLearning;
+  if (!breakLearning.breakPatterns[streakLen]) {
+    breakLearning.breakPatterns[streakLen] = { total: 0, success: 0 };
+  }
+  breakLearning.breakPatterns[streakLen].total++;
+  if (isSuccess) breakLearning.breakPatterns[streakLen].success++;
+  breakLearning.breakCount++;
+  if (isSuccess) breakLearning.successCount++;
+  breakLearning.lastBreak = Date.now();
+  DB.saveBreakLearning(breakLearning);
+}
+
+// Ghi nhận kết quả bẻ cầu (gọi khi có kết quả thực tế)
+function recordBreakResult(actual, predictedBreak) {
+  if (!predictedBreak) return;
+  const isSuccess = (actual === predictedBreak);
+  if (isSuccess) {
+    log.info(`🎉 Bẻ cầu thành công! Dự đoán ${predictedBreak} đúng với thực tế.`);
+  }
+  // Ở đây có thể lưu thêm nếu cần
+}
+
+function updateHistory(phien, actual, aiPred, aiConf, source, breakSuggestion) {
+  let hist = DB.history;
+  const existing = hist.find(h => h.phien === phien);
+  if (existing) {
+    if (actual && !existing.actual) {
+      existing.actual = actual;
+      if (existing.ai_pred) existing.correct = existing.ai_pred === actual;
+      // Nếu có cảnh báo bẻ cầu, kiểm tra xem có đúng không
+      if (existing.breakSuggestion && existing.breakSuggestion === actual) {
+        existing.breakSuccess = true;
+        updateBreakLearning(existing.streakLen, true);
+      }
+    }
+    DB.saveHistory(hist);
+    return;
+  }
+  hist.unshift({ phien, actual, ai_pred: aiPred, ai_conf: aiConf, source, ts: Date.now(), breakSuggestion, streakLen: null, breakSuccess: false });
+  if (hist.length > CONFIG.MAX_HISTORY) hist = hist.slice(0, CONFIG.MAX_HISTORY);
+  DB.saveHistory(hist);
+}
+
 function getHistoryStats() {
   const hist = DB.history;
   if (hist.length < 3) return null;
@@ -242,22 +307,6 @@ function getHistoryStats() {
   return { streak, streakVal: cur, breakRate, accuracy, total: hist.length };
 }
 
-function updateHistory(phien, actual, aiPred, aiConf, source) {
-  let hist = DB.history;
-  const existing = hist.find(h => h.phien === phien);
-  if (existing) {
-    if (actual && !existing.actual) {
-      existing.actual = actual;
-      if (existing.ai_pred) existing.correct = existing.ai_pred === actual;
-    }
-    DB.saveHistory(hist);
-    return;
-  }
-  hist.unshift({ phien, actual, ai_pred: aiPred, ai_conf: aiConf, source, ts: Date.now() });
-  if (hist.length > CONFIG.MAX_HISTORY) hist = hist.slice(0, CONFIG.MAX_HISTORY);
-  DB.saveHistory(hist);
-}
-
 // ═══════════════════════════════════════════════════════
 //  FORMAT MESSAGES
 // ═══════════════════════════════════════════════════════
@@ -272,7 +321,7 @@ function fmtMoney(n) {
   return String(n);
 }
 
-function formatPrediction(data, histStats) {
+function formatPrediction(data, histStats, streakAnalysis) {
   const isTai = data.result === 'tai';
   const icon = isTai ? '🟢' : '🔴';
   const word = isTai ? '⬆️ TÀI' : '⬇️ XỈU';
@@ -283,8 +332,9 @@ function formatPrediction(data, histStats) {
   msg += `║ ${icon} <b>${word}</b>  |  Tin cậy: <b>${conf}%</b>\n`;
   msg += `║ ${bar}\n`;
   msg += `║ Nguồn: <b>${data.source}</b>\n`;
-
-  if (data.phien) msg += `║ Phiên: <b>${data.phien}</b>\n`;
+  msg += `║ 📌 Phiên hiện tại: <b>${data.phien}</b>\n`;
+  if (data.nextPhien) msg += `║ 🔮 Dự đoán phiên <b>${data.nextPhien}</b>:\n`;
+  msg += `\n`;
 
   if (data.dice && data.dice[0]) {
     msg += `╠══ Phiên vừa xong ══\n`;
@@ -308,15 +358,26 @@ function formatPrediction(data, histStats) {
     }
   }
 
-  if (histStats && histStats.total >= 5) {
-    const bPct = Math.round(histStats.breakRate * 100);
-    const strVal = histStats.streakVal === 'tai' ? 'TÀI' : 'XỈU';
-    msg += `╠══ Phân tích cầu ══\n`;
-    msg += `║ 📊 Cầu: <b>${strVal} ×${histStats.streak}</b>\n`;
-    msg += `║ 🔄 Tỉ lệ bẻ: <b>${bPct}%</b>\n`;
-    if (histStats.accuracy !== null) {
-      msg += `║ ✅ Độ chính xác AI: <b>${Math.round(histStats.accuracy*100)}%</b> (${histStats.total} ván)\n`;
+  // PHÂN TÍCH CẦU & CẢNH BÁO BẺ
+  if (streakAnalysis && streakAnalysis.total >= 5) {
+    msg += `╠══ 📊 PHÂN TÍCH CẦU ══\n`;
+    msg += `║ 🔄 Cầu hiện tại: <b>${streakAnalysis.streakVal === 'tai' ? 'TÀI' : 'XỈU'} ×${streakAnalysis.streak}</b>\n`;
+    msg += `║ 📈 Tỉ lệ bẻ cầu lịch sử: <b>${streakAnalysis.breakRate.toFixed(1)}%</b>\n`;
+    
+    if (streakAnalysis.breakWarning) {
+      msg += `╠══ ⚠️ <b>CẢNH BÁO BẺ CẦU</b> ══\n`;
+      msg += `║ 🔔 Chuỗi đã dài ${streakAnalysis.streak} ván!\n`;
+      msg += `║ 💡 Khuyến nghị: <b>ĐÁNH ${streakAnalysis.breakSuggestion === 'tai' ? 'TÀI' : 'XỈU'}</b>\n`;
+      msg += `║ 🧠 Độ tin cậy bẻ: <b>${streakAnalysis.breakConfidence}%</b>\n`;
     }
+  }
+
+  // Thống kê học bẻ cầu
+  const breakLearning = DB.breakLearning;
+  if (breakLearning.breakCount > 0) {
+    const successRate = Math.round((breakLearning.successCount / breakLearning.breakCount) * 100);
+    msg += `╠══ 🧠 AI HỌC BẺ CẦU ══\n`;
+    msg += `║ 📊 Tỉ lệ bẻ thành công: <b>${successRate}%</b> (${breakLearning.successCount}/${breakLearning.breakCount})\n`;
   }
 
   msg += `╚══════════════════\n`;
@@ -345,7 +406,7 @@ function requireAdmin(msg, fn) {
 }
 
 // ═══════════════════════════════════════════════════════
-//  KEY MANAGEMENT
+//  KEY MANAGEMENT (giữ nguyên)
 // ═══════════════════════════════════════════════════════
 bot.onText(/\/addkey(?:\s+(.+))?/, (msg, match) => {
   requireAdmin(msg, () => {
@@ -498,10 +559,13 @@ bot.onText(/\/now$/, async (msg) => {
   const loadingMsg = await bot.sendMessage(uid, '⏳ Đang lấy dữ liệu...', { parse_mode: 'HTML' });
   try {
     const data = await fetchBySource(`V${u.source || 3}`);
-    const hist = getHistoryStats();
-    if (data.phien && data.actual) updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
-    const text = formatPrediction(data, hist);
+    const hist = DB.history;
+    const streakAnalysis = analyzeStreak(hist);
+    const text = formatPrediction(data, null, streakAnalysis);
     await bot.editMessageText(text, { chat_id: uid, message_id: loadingMsg.message_id, parse_mode: 'HTML' });
+    if (data.phien && data.actual) {
+      updateHistory(data.phien, data.actual, data.result, data.conf, data.source, streakAnalysis?.breakSuggestion);
+    }
   } catch(e) {
     log.error(`/now error for ${uid}:`, e.message);
     await bot.editMessageText(`❌ Lỗi lấy dữ liệu: ${e.message}`, { chat_id: uid, message_id: loadingMsg.message_id });
@@ -533,16 +597,18 @@ bot.onText(/\/stats$/, (msg) => {
   if (!checkActive(uid, msg)) return;
   const u = DB.users[uid];
   const s = DB.stats[uid] || {};
-  const hist = getHistoryStats();
+  const hist = DB.history;
+  const streakAnalysis = analyzeStreak(hist);
   let text = `📊 <b>Thống kê của bạn</b>\n\n📡 Nguồn: <b>V${u.source || 3}</b>\n▶️ Auto: ${u.autoOn ? 'Đang bật' : 'Đang tắt'}\n⏰ Key: ${formatExpiry(u.keyExpires)}\n\n`;
   if (s.total) {
     const acc = Math.round((s.correct || 0) / s.total * 100);
     text += `🎯 <b>Độ chính xác AI: ${acc}%</b>\n📈 Tổng dự đoán: ${s.total}\n✅ Đúng: ${s.correct || 0} | ❌ Sai: ${s.total - (s.correct||0)}\n\n`;
   } else { text += `📈 Chưa có dữ liệu thống kê\n\n`; }
-  if (hist) {
-    const bPct = Math.round(hist.breakRate * 100);
-    text += `📊 <b>Phân tích cầu (${hist.total} ván)</b>\n🔄 Cầu hiện tại: <b>${hist.streakVal === 'tai' ? 'TÀI' : 'XỈU'} ×${hist.streak}</b>\n🔀 Tỉ lệ bẻ cầu: <b>${bPct}%</b>\n`;
-    if (hist.accuracy !== null) text += `🤖 Độ chính xác global: <b>${Math.round(hist.accuracy*100)}%</b>\n`;
+  if (streakAnalysis && streakAnalysis.total >= 5) {
+    text += `📊 <b>PHÂN TÍCH CẦU</b>\n🔄 Cầu hiện tại: <b>${streakAnalysis.streakVal === 'tai' ? 'TÀI' : 'XỈU'} ×${streakAnalysis.streak}</b>\n🔀 Tỉ lệ bẻ cầu lịch sử: <b>${streakAnalysis.breakRate.toFixed(1)}%</b>\n`;
+    if (streakAnalysis.breakWarning) {
+      text += `⚠️ <b>CẢNH BÁO: Chuỗi đã dài ${streakAnalysis.streak} ván! Khả năng bẻ cầu cao.</b>\n`;
+    }
   }
   bot.sendMessage(uid, text, { parse_mode: 'HTML' });
 });
@@ -554,7 +620,7 @@ bot.onText(/\/stats$/, (msg) => {
     const users = DB.users;
     users[uid].source = v;
     DB.saveUsers(users);
-    const desc = { 1: 'V1 — Phân tích dữ liệu cược (người + tiền)', 2: 'V2 — Dự đoán ML từ API', 3: 'V3 — Kết hợp thông minh V1+V2' };
+    const desc = { 1: 'V1 — Phân tích dữ liệu cược', 2: 'V2 — Dự đoán ML từ API', 3: 'V3 — Kết hợp thông minh V1+V2 + phân tích cầu' };
     bot.sendMessage(uid, `✅ Đã chuyển sang <b>${desc[v]}</b>`, { parse_mode: 'HTML' });
     log.info(`User ${uid} chuyển sang V${v}`);
   });
@@ -562,7 +628,7 @@ bot.onText(/\/stats$/, (msg) => {
 
 bot.onText(/\/help$/, (msg) => {
   const uid = String(msg.chat.id);
-  let text = `📖 <b>Hướng dẫn sử dụng</b>\n\n<b>Lệnh user:</b>\n• /key MÃ → Kích hoạt key\n• /now → Dự đoán ngay\n• /startbot → Bật auto 60s\n• /stop → Tắt auto\n• /stats → Thống kê cá nhân\n• /V1 /V2 /V3 → Chọn nguồn\n\n`;
+  let text = `📖 <b>Hướng dẫn sử dụng</b>\n\n<b>Lệnh user:</b>\n• /key MÃ → Kích hoạt key\n• /now → Dự đoán ngay (kèm phân tích cầu)\n• /startbot → Bật auto 60s\n• /stop → Tắt auto\n• /stats → Thống kê cá nhân + phân tích cầu\n• /V1 /V2 /V3 → Chọn nguồn dự đoán\n\n`;
   if (isAdmin(uid)) text += `<b>Lệnh admin:</b>\n• /addkey tên [thời gian] → Tạo key\n  Thời gian: 1p 2h 7d 1t 1th\n• /delkey MÃ → Xóa key\n• /keys → Danh sách key\n• /users → Danh sách user\n• /info [ID] → Chi tiết user\n• /deluser ID → Xóa user\n`;
   bot.sendMessage(uid, text, { parse_mode: 'HTML' });
 });
@@ -590,10 +656,13 @@ function startUserAuto(uid) {
     }
     try {
       const data = await fetchBySource(`V${u.source || 3}`);
-      const hist = getHistoryStats();
-      if (data.phien && data.actual) updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
-      const text = formatPrediction(data, hist);
+      const hist = DB.history;
+      const streakAnalysis = analyzeStreak(hist);
+      const text = formatPrediction(data, null, streakAnalysis);
       await bot.sendMessage(uid, text, { parse_mode: 'HTML' });
+      if (data.phien && data.actual) {
+        updateHistory(data.phien, data.actual, data.result, data.conf, data.source, streakAnalysis?.breakSuggestion);
+      }
     } catch(e) {
       log.error(`Auto send error for ${uid}:`, e.message);
     }
@@ -643,7 +712,7 @@ setInterval(() => {
 }, 5 * 60 * 1000);
 
 // ═══════════════════════════════════════════════════════
-//  EXPRESS SERVER
+//  EXPRESS SERVER (giữ bot sống)
 // ═══════════════════════════════════════════════════════
 const app = express();
 app.use(express.json());
@@ -662,7 +731,7 @@ restoreAutoUsers();
 log.ok('✅ Bot đã khởi động thành công!');
 log.info(`Admin ID: ${CONFIG.ADMIN_ID}`);
 try {
-  bot.sendMessage(CONFIG.ADMIN_ID, `🟢 <b>Bot LC79 đã online!</b>\n🕐 ${ts()}`, { parse_mode: 'HTML' });
+  bot.sendMessage(CONFIG.ADMIN_ID, `🟢 <b>Bot LC79 đã online!</b>\n🧠 Đã bật phân tích cầu & học bẻ cầu`, { parse_mode: 'HTML' });
 } catch(e) {}
 
 process.on('uncaughtException',  (e) => log.error('uncaughtException:', e.message));
