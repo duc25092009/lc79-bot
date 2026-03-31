@@ -1,596 +1,974 @@
 /**
- * LC79 Tài Xỉu Bot – Tích hợp tự ping + health check
- * Deploy trên Render, tự động giữ bot chạy (không sleep)
+ * LC79 Tài Xỉu Prediction Bot
+ * Node.js + Telegram Bot API
+ * Deploy: Render.com
  */
 
 'use strict';
 
 const TelegramBot = require('node-telegram-bot-api');
-const sqlite3 = require('sqlite3').verbose();
-const NodeCache = require('node-cache');
-const fs = require('fs');
-const path = require('path');
-const http = require('http');
+const fetch       = require('node-fetch');
+const express     = require('express');
+const fs          = require('fs');
+const path        = require('path');
 
-// ========== CẤU HÌNH ==========
+// ═══════════════════════════════════════════════════════
+//  CONFIG
+// ═══════════════════════════════════════════════════════
 const CONFIG = {
-  BOT_TOKEN:     process.env.BOT_TOKEN    || 'YOUR_BOT_TOKEN_HERE',
-  ADMIN_ID:      process.env.ADMIN_ID     || 'YOUR_ADMIN_CHAT_ID',
-  API_V1:        'https://living-telecommunications-start-consoles.trycloudflare.com/api/txmd5',
-  API_V2:        'https://lc79-betvip-api-production.up.railway.app/api/lc79_md5?key=apihdx',
-  DATA_DIR:      './data',
-  DB_PATH:       './data/lc79.db',
-  BACKUP_DIR:    './backups',
-  AUTO_INTERVAL: 30000,
-  API_TIMEOUT:   6000,
-  CACHE_TTL:     2,
-  MAX_HISTORY:   500,
-  PORT:          process.env.PORT || 3000,
+  BOT_TOKEN:    process.env.BOT_TOKEN    || 'YOUR_BOT_TOKEN_HERE',
+  ADMIN_ID:     process.env.ADMIN_ID     || 'YOUR_ADMIN_CHAT_ID',
+  PORT:         process.env.PORT         || 3000,
+
+  // APIs
+  API_V1: 'https://living-telecommunications-start-consoles.trycloudflare.com/api/txmd5',
+  API_V2: 'https://lc79-betvip-api-production.up.railway.app/api/lc79_md5?key=apihdx',
+
+  // Giới hạn
+  MAX_HISTORY:   1000,   // lưu tối đa 1000 ván lịch sử
+  AUTO_INTERVAL: 60000,  // 60 giây
+  API_TIMEOUT:   8000,   // 8 giây timeout
+
+  // Files
+  KEYS_FILE:   './data/keys.json',
+  USERS_FILE:  './data/users.json',
+  STATS_FILE:  './data/stats.json',
+  HISTORY_FILE:'./data/history.json',
 };
 
-// Tạo thư mục
-if (!fs.existsSync(CONFIG.DATA_DIR)) fs.mkdirSync(CONFIG.DATA_DIR, { recursive: true });
-if (!fs.existsSync(CONFIG.BACKUP_DIR)) fs.mkdirSync(CONFIG.BACKUP_DIR, { recursive: true });
+// ═══════════════════════════════════════════════════════
+//  LOGGER
+// ═══════════════════════════════════════════════════════
+const log = {
+  info:  (...a) => console.log(`[${ts()}] [INFO]`, ...a),
+  warn:  (...a) => console.warn(`[${ts()}] [WARN]`, ...a),
+  error: (...a) => console.error(`[${ts()}] [ERR]`,  ...a),
+  ok:    (...a) => console.log(`[${ts()}] [OK]`,   ...a),
+};
+function ts() { return new Date().toLocaleString('vi-VN'); }
 
-const apiCache = new NodeCache({ stdTTL: CONFIG.CACHE_TTL });
+// ═══════════════════════════════════════════════════════
+//  DATA LAYER — đọc/ghi JSON
+// ═══════════════════════════════════════════════════════
+if (!fs.existsSync('./data')) fs.mkdirSync('./data');
 
-// ========== SQLITE ==========
-const db = new sqlite3.Database(CONFIG.DB_PATH);
-const promisify = (fn) => (...args) => new Promise((resolve, reject) => {
-  fn.call(db, ...args, (err, result) => err ? reject(err) : resolve(result));
-});
-db.getAsync = promisify(db.get.bind(db));
-db.allAsync = promisify(db.all.bind(db));
-db.runAsync = promisify(db.run.bind(db));
-
-async function initDB() {
-  await db.runAsync(`CREATE TABLE IF NOT EXISTS keys (code TEXT PRIMARY KEY, name TEXT, created INTEGER, expires INTEGER, duration TEXT, usedBy TEXT, createdBy TEXT)`);
-  await db.runAsync(`CREATE TABLE IF NOT EXISTS users (id TEXT PRIMARY KEY, first_name TEXT, last_name TEXT, username TEXT, key TEXT, key_expires INTEGER, source INTEGER DEFAULT 3, auto_on INTEGER DEFAULT 0, activated_at INTEGER)`);
-  await db.runAsync(`CREATE TABLE IF NOT EXISTS stats (user_id TEXT PRIMARY KEY, total INTEGER DEFAULT 0, correct INTEGER DEFAULT 0)`);
-  await db.runAsync(`CREATE TABLE IF NOT EXISTS history (id INTEGER PRIMARY KEY AUTOINCREMENT, phien INTEGER, actual TEXT, ai_pred TEXT, ai_conf INTEGER, source TEXT, ts INTEGER)`);
-  await db.runAsync(`CREATE INDEX IF NOT EXISTS idx_history_phien ON history(phien)`);
-  await db.runAsync(`CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)`);
-  console.log('✅ Database initialized');
+function readJSON(file, def = {}) {
+  try {
+    if (!fs.existsSync(file)) { writeJSON(file, def); return def; }
+    return JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch(e) { log.error(`readJSON ${file}:`, e.message); return def; }
 }
-initDB().catch(console.error);
-
-// ========== API HELPERS ==========
-async function apiFetch(url, timeout = CONFIG.API_TIMEOUT) {
-  const cached = apiCache.get(url);
-  if (cached) return cached;
-  const proxies = ['https://api.allorigins.win/raw?url=', 'https://corsproxy.io/?', ''];
-  for (const proxy of proxies) {
-    try {
-      const fetchUrl = proxy ? proxy + encodeURIComponent(url) : url;
-      const controller = new AbortController();
-      const timer = setTimeout(() => controller.abort(), timeout);
-      const res = await fetch(fetchUrl, { signal: controller.signal });
-      clearTimeout(timer);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      apiCache.set(url, data);
-      return data;
-    } catch(e) {}
-  }
-  throw new Error('All proxies failed');
+function writeJSON(file, data) {
+  try { fs.writeFileSync(file, JSON.stringify(data, null, 2)); }
+  catch(e) { log.error(`writeJSON ${file}:`, e.message); }
 }
 
-async function fetchV1() {
-  const raw = await apiFetch(CONFIG.API_V1);
-  const betting = raw.betting_info || {};
-  const taiPeople = betting.nguoi_cuoc?.tai || 0;
-  const xiuPeople = betting.nguoi_cuoc?.xiu || 0;
-  const taiMoneyRaw = betting.tien_cuoc?.tai || '0';
-  const xiuMoneyRaw = betting.tien_cuoc?.xiu || '0';
-  const taiMoney = parseFloat(String(taiMoneyRaw).replace(/\./g, ''));
-  const xiuMoney = parseFloat(String(xiuMoneyRaw).replace(/\./g, ''));
-  const totalPeople = taiPeople + xiuPeople || 1;
-  const totalMoney = taiMoney + xiuMoney || 1;
+// Khởi tạo files nếu chưa có
+const DB = {
+  get keys()    { return readJSON(CONFIG.KEYS_FILE,    {}); },
+  get users()   { return readJSON(CONFIG.USERS_FILE,   {}); },
+  get stats()   { return readJSON(CONFIG.STATS_FILE,   {}); },
+  get history() { return readJSON(CONFIG.HISTORY_FILE, []); },
 
-  let score = 0.5;
-  if (totalPeople > 0) score += (taiPeople - xiuPeople) / totalPeople * 0.25;
-  if (totalMoney > 0) score += (taiMoney - xiuMoney) / totalMoney * 0.25;
-  const pTai = Math.min(0.93, Math.max(0.07, score));
-  const prediction = pTai >= 0.5 ? 'Tài' : 'Xỉu';
-  const confidence = Math.round(Math.max(pTai, 1 - pTai) * 100);
+  saveKeys(d)    { writeJSON(CONFIG.KEYS_FILE,    d); },
+  saveUsers(d)   { writeJSON(CONFIG.USERS_FILE,   d); },
+  saveStats(d)   { writeJSON(CONFIG.STATS_FILE,   d); },
+  saveHistory(d) { writeJSON(CONFIG.HISTORY_FILE, d); },
+};
 
-  return {
-    source: 'V1',
-    prediction,
-    confidence,
-    phien: raw.phien || 0,
-    nextPhien: raw.phien ? raw.phien + 1 : 0,
-    dice: [raw.xuc_xac_1, raw.xuc_xac_2, raw.xuc_xac_3],
-    tong: raw.tong || 0,
-    actual: raw.ket_qua || '',
-    taiPeople, xiuPeople, taiMoney, xiuMoney
-  };
+// ═══════════════════════════════════════════════════════
+//  PARSE THỜI GIAN từ chuỗi: 1p=1 phút, 1h=1giờ, 1d=1ngày, 1t=1tuần, 1th=1tháng
+// ═══════════════════════════════════════════════════════
+function parseDuration(str) {
+  if (!str) return 30 * 24 * 60 * 60 * 1000; // mặc định 30 ngày
+  str = str.toLowerCase().trim();
+  const num = parseFloat(str);
+  if (isNaN(num)) return null;
+  if (str.endsWith('th')) return num * 30 * 24 * 60 * 60 * 1000;  // tháng
+  if (str.endsWith('t'))  return num * 7  * 24 * 60 * 60 * 1000;  // tuần
+  if (str.endsWith('d'))  return num * 24 * 60 * 60 * 1000;       // ngày
+  if (str.endsWith('h'))  return num * 60 * 60 * 1000;            // giờ
+  if (str.endsWith('p'))  return num * 60 * 1000;                  // phút
+  return null;
 }
 
-async function fetchV2() {
-  const raw = await apiFetch(CONFIG.API_V2);
-  let prediction = null;
-  if (raw.du_doan) {
-    prediction = raw.du_doan === 'Tài' ? 'Tài' : 'Xỉu';
-  }
-  let confidence = 50;
-  if (raw.do_tin_cay) {
-    const match = raw.do_tin_cay.match(/\d+/);
-    if (match) confidence = parseInt(match[0]);
-  }
-
-  return {
-    source: 'V2',
-    prediction,
-    confidence,
-    phien: raw.phien || 0,
-    nextPhien: raw.phien_hien_tai || (raw.phien ? raw.phien + 1 : 0),
-    dice: [raw.xuc_xac_1, raw.xuc_xac_2, raw.xuc_xac_3],
-    tong: raw.tong || 0,
-    actual: raw.ket_qua || ''
-  };
-}
-
-async function getStreakAnalysis() {
-  const history = await db.allAsync('SELECT actual FROM history ORDER BY ts DESC LIMIT 50');
-  if (history.length < 5) return null;
-
-  const seq = history.filter(h => h.actual).map(h => h.actual);
-  if (seq.length === 0) return null;
-
-  const cur = seq[0];
-  let streak = 1;
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i] === cur) streak++;
-    else break;
-  }
-
-  let breaks = 0;
-  for (let i = 1; i < seq.length; i++) {
-    if (seq[i] !== seq[i-1]) breaks++;
-  }
-  const breakRate = seq.length > 1 ? (breaks / (seq.length - 1)) * 100 : 0;
-
-  return { cur, streak, breakRate, total: seq.length };
-}
-
-async function getPredictionBySource(source) {
-  const [v1, v2, streak] = await Promise.all([fetchV1(), fetchV2(), getStreakAnalysis()]);
-
-  if (source === 'V1') return v1;
-  if (source === 'V2') return v2;
-  if (source === 'V3') {
-    if (v2.prediction && v2.confidence >= 65) {
-      return { ...v2, source: 'V3(→V2)' };
-    }
-    if (streak && streak.streak >= 4) {
-      const opposite = streak.cur === 'Tài' ? 'Xỉu' : 'Tài';
-      return {
-        source: 'V3(→Streak)',
-        prediction: opposite,
-        confidence: Math.min(85, 55 + streak.streak * 5),
-        phien: v1.phien || v2.phien,
-        nextPhien: v2.nextPhien || (v1.phien + 1),
-        dice: v1.dice || v2.dice,
-        tong: v1.tong || v2.tong,
-        actual: v1.actual || v2.actual,
-        taiPeople: v1.taiPeople,
-        xiuPeople: v1.xiuPeople,
-        taiMoney: v1.taiMoney,
-        xiuMoney: v1.xiuMoney
-      };
-    }
-    return { ...v1, source: 'V3(→V1)' };
-  }
-  return v1;
-}
-
-// ========== HÀM TIỆN ÍCH ==========
 function formatDuration(ms) {
-  if (!ms) return '0 giây';
   const s = ms / 1000;
-  if (s < 60) return `${s.toFixed(0)} giây`;
-  if (s < 3600) return `${(s/60).toFixed(0)} phút`;
-  if (s < 86400) return `${(s/3600).toFixed(1)} giờ`;
-  if (s < 2592000) return `${(s/86400).toFixed(1)} ngày`;
+  if (s < 60)          return `${s.toFixed(0)} giây`;
+  if (s < 3600)        return `${(s/60).toFixed(0)} phút`;
+  if (s < 86400)       return `${(s/3600).toFixed(1)} giờ`;
+  if (s < 2592000)     return `${(s/86400).toFixed(1)} ngày`;
   return `${(s/2592000).toFixed(1)} tháng`;
 }
 
 function formatExpiry(exp) {
-  if (!exp) return 'Vĩnh viễn';
+  if (!exp) return 'Không giới hạn';
   const diff = exp - Date.now();
   if (diff <= 0) return '⛔ Đã hết hạn';
   return `⏳ Còn ${formatDuration(diff)}`;
 }
 
-function parseDuration(str) {
-  if (!str) return 30 * 24 * 60 * 60 * 1000;
-  str = str.toLowerCase().trim();
-  const num = parseFloat(str);
-  if (isNaN(num)) return null;
-  if (str.endsWith('th')) return num * 30 * 24 * 60 * 60 * 1000;
-  if (str.endsWith('t')) return num * 7 * 24 * 60 * 60 * 1000;
-  if (str.endsWith('d')) return num * 24 * 60 * 60 * 1000;
-  if (str.endsWith('h')) return num * 60 * 60 * 1000;
-  if (str.endsWith('p')) return num * 60 * 1000;
-  return null;
-}
-
-function formatVietnamTime(timestamp) {
-  if (!timestamp) return 'Vĩnh viễn';
-  return new Date(timestamp).toLocaleString('vi-VN', { timeZone: 'Asia/Ho_Chi_Minh' });
-}
-
-async function updateHistory(phien, actual, aiPred, aiConf, source) {
-  const existing = await db.getAsync('SELECT 1 FROM history WHERE phien = ?', phien);
-  if (existing) return;
-  await db.runAsync(`INSERT INTO history (phien, actual, ai_pred, ai_conf, source, ts) VALUES (?, ?, ?, ?, ?, ?)`, phien, actual, aiPred, aiConf, source, Date.now());
-  const count = await db.getAsync('SELECT COUNT(*) as c FROM history');
-  if (count.c > CONFIG.MAX_HISTORY) {
-    await db.runAsync(`DELETE FROM history WHERE id IN (SELECT id FROM history ORDER BY ts ASC LIMIT ?)`, count.c - CONFIG.MAX_HISTORY);
+// ═══════════════════════════════════════════════════════
+//  API HELPERS
+// ═══════════════════════════════════════════════════════
+async function apiFetch(url, timeout = CONFIG.API_TIMEOUT) {
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), timeout);
+  try {
+    const res = await fetch(url, { signal: ctrl.signal });
+    clearTimeout(timer);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch(e) {
+    clearTimeout(timer);
+    throw e;
   }
 }
 
-async function updateUserStats(userId, prediction, actual) {
-  if (!actual) return;
-  const correct = (prediction === actual) ? 1 : 0;
-  await db.runAsync(`INSERT INTO stats (user_id, total, correct) VALUES (?, 1, ?) ON CONFLICT(user_id) DO UPDATE SET total = total + 1, correct = correct + excluded.correct`, userId, correct);
+/** Lấy dữ liệu từ API V1 (betting data) */
+async function fetchV1() {
+  const data = await apiFetch(CONFIG.API_V1);
+  // Parse nhiều format có thể có
+  const item = Array.isArray(data) ? data[0] : (data.data || data);
+  if (!item) throw new Error('V1: empty response');
+
+  // Trích xuất dữ liệu cược
+  const taiPeople  = Number(item.tai_count  || item.taiCount  || item.tai_player  || 0);
+  const xiuPeople  = Number(item.xiu_count  || item.xiuCount  || item.xiu_player  || 0);
+  const taiMoney   = Number(item.tai_money  || item.taiMoney  || item.tai_amount  || 0);
+  const xiuMoney   = Number(item.xiu_money  || item.xiuMoney  || item.xiu_amount  || 0);
+  const phien      = Number(item.phien || item.session || item.id || 0);
+
+  const totalPeople = taiPeople + xiuPeople || 1;
+  const totalMoney  = taiMoney  + xiuMoney  || 1;
+
+  // Công thức: 0.5 + bias từ người + bias từ tiền
+  const pTai = 0.5
+    + (taiPeople - xiuPeople) / totalPeople * 0.25
+    + (taiMoney  - xiuMoney)  / totalMoney  * 0.25;
+
+  const clampedP = Math.min(0.93, Math.max(0.07, pTai));
+  const result   = clampedP >= 0.5 ? 'tai' : 'xiu';
+  const conf     = Math.round(Math.max(clampedP, 1 - clampedP) * 100);
+
+  return {
+    source: 'V1',
+    phien,
+    result,
+    conf,
+    pTai: clampedP,
+    taiPeople, xiuPeople, taiMoney, xiuMoney,
+    raw: item,
+  };
 }
 
-async function getUserStats(userId) {
-  return await db.getAsync('SELECT total, correct FROM stats WHERE user_id = ?', userId);
+/** Lấy dữ liệu từ API V2 (ML prediction) */
+async function fetchV2() {
+  const data = await apiFetch(CONFIG.API_V2);
+  const item = Array.isArray(data) ? data[0] : (data.data || data);
+  if (!item) throw new Error('V2: empty response');
+
+  // Parse kết quả
+  const du_doan   = item.du_doan   || item.prediction || item.result || '';
+  const do_tin_cay = Number(item.do_tin_cay || item.confidence || item.conf || 50);
+  const phien     = Number(item.phien || item.session || 0);
+  const ket_qua   = item.ket_qua || item.actual_result || '';
+
+  // Normalize kết quả
+  let result = du_doan.toLowerCase();
+  if (result.includes('tài') || result === 'tai') result = 'tai';
+  else if (result.includes('xỉu') || result === 'xiu') result = 'xiu';
+
+  // Kết quả thực tế (để tính độ chính xác)
+  let actual = ket_qua.toLowerCase();
+  if (actual.includes('tài') || actual === 'tai') actual = 'tai';
+  else if (actual.includes('xỉu') || actual === 'xiu') actual = 'xiu';
+  else actual = null;
+
+  // Xúc xắc
+  const dice = [
+    Number(item.xuc_xac_1 || item.d1 || 0),
+    Number(item.xuc_xac_2 || item.d2 || 0),
+    Number(item.xuc_xac_3 || item.d3 || 0),
+  ];
+  const tong = Number(item.tong || item.total || dice.reduce((a,b)=>a+b,0));
+
+  return {
+    source: 'V2',
+    phien,
+    result,
+    conf:    do_tin_cay,
+    actual,
+    dice,
+    tong,
+    time:    item.thoi_gian || item.time || '',
+    md5_enc: item.md5_enc || '',
+    raw: item,
+  };
 }
 
-function formatPrediction(data, userStats, streakAnalysis) {
-  const isTai = data.prediction === 'Tài';
-  const icon = isTai ? '🟢' : '🔴';
-  const word = isTai ? '⬆️ TÀI' : '⬇️ XỈU';
-  const conf = data.confidence || 50;
-  const bar = '█'.repeat(Math.round(conf/10)) + '░'.repeat(10-Math.round(conf/10));
+/** V3: kết hợp thông minh V1 + V2 */
+async function fetchV3() {
+  const [v1Res, v2Res] = await Promise.allSettled([fetchV1(), fetchV2()]);
+
+  const v1 = v1Res.status === 'fulfilled' ? v1Res.value : null;
+  const v2 = v2Res.status === 'fulfilled' ? v2Res.value : null;
+
+  let chosen, note;
+  if (v2 && v2.conf >= 60) {
+    chosen = { ...v2, source: 'V3(→V2)' };
+    note = `V2 tin cậy cao (${v2.conf}%)`;
+  } else if (v1) {
+    chosen = { ...v1, source: 'V3(→V1)' };
+    note = v2 ? `V2 tin cậy thấp (${v2.conf}%), dùng V1` : 'V2 lỗi, dùng V1';
+  } else if (v2) {
+    chosen = { ...v2, source: 'V3(→V2)' };
+    note = 'V1 lỗi, fallback V2';
+  } else {
+    throw new Error('Cả V1 và V2 đều thất bại');
+  }
+
+  return { ...chosen, v1Data: v1, v2Data: v2, v3Note: note };
+}
+
+/** Fetch theo source của user */
+async function fetchBySource(source) {
+  switch (source) {
+    case 'V1': return fetchV1();
+    case 'V2': return fetchV2();
+    case 'V3': return fetchV3();
+    default:   return fetchV3();
+  }
+}
+
+// ═══════════════════════════════════════════════════════
+//  PREDICTION ENGINE — kết hợp history + live data
+// ═══════════════════════════════════════════════════════
+function getHistoryStats() {
+  const hist = DB.history;
+  if (hist.length < 3) return null;
+
+  // Sequence Tài/Xỉu gần nhất (mới nhất trước)
+  const seq = hist.filter(h => h.actual).map(h => h.actual);
+
+  // Streak hiện tại
+  const cur = seq[0];
+  let streak = 0;
+  for (const v of seq) { if (v === cur) streak++; else break; }
+
+  // Tỉ lệ bẻ cầu
+  let breaks = 0;
+  for (let i = 0; i < seq.length - 1; i++) if (seq[i] !== seq[i+1]) breaks++;
+  const breakRate = breaks / Math.max(seq.length - 1, 1);
+
+  // Độ chính xác AI
+  const withPred = hist.filter(h => h.ai_pred && h.actual);
+  const correct  = withPred.filter(h => h.ai_pred === h.actual).length;
+  const accuracy = withPred.length > 0 ? correct / withPred.length : null;
+
+  return { seq, streak, streakVal: cur, breakRate, accuracy, total: hist.length };
+}
+
+/** Cập nhật history với kết quả thực tế mới */
+function updateHistory(phien, actual, aiPred, aiConf, source) {
+  let hist = DB.history;
+
+  // Kiểm tra phiên đã tồn tại chưa
+  const existing = hist.find(h => h.phien === phien);
+  if (existing) {
+    if (actual && !existing.actual) {
+      existing.actual = actual;
+      // Check xem dự đoán trước đó có đúng không
+      if (existing.ai_pred) {
+        existing.correct = existing.ai_pred === actual;
+      }
+    }
+    DB.saveHistory(hist);
+    return;
+  }
+
+  // Thêm mới
+  hist.unshift({ phien, actual, ai_pred: aiPred, ai_conf: aiConf, source, ts: Date.now() });
+  if (hist.length > CONFIG.MAX_HISTORY) hist = hist.slice(0, CONFIG.MAX_HISTORY);
+  DB.saveHistory(hist);
+}
+
+// ═══════════════════════════════════════════════════════
+//  FORMAT MESSAGES
+// ═══════════════════════════════════════════════════════
+const DICE_ICONS = { 1:'⚀', 2:'⚁', 3:'⚂', 4:'⚃', 5:'⚄', 6:'⚅' };
+function diceStr(arr) {
+  return arr.map(d => DICE_ICONS[d] || '🎲').join(' ');
+}
+
+function formatPrediction(data, histStats) {
+  const isTai = data.result === 'tai';
+  const icon  = isTai ? '🟢' : '🔴';
+  const word  = isTai ? '⬆️ TÀI' : '⬇️ XỈU';
+  const conf  = data.conf || 50;
+  const bar   = '█'.repeat(Math.round(conf/10)) + '░'.repeat(10-Math.round(conf/10));
 
   let msg = `╔══ 🎯 DỰ ĐOÁN LC79 ══╗\n`;
   msg += `║ ${icon} <b>${word}</b>  |  Tin cậy: <b>${conf}%</b>\n`;
   msg += `║ ${bar}\n`;
   msg += `║ Nguồn: <b>${data.source}</b>\n`;
-  msg += `║ 📌 Phiên hiện tại: <b>${data.phien}</b>\n`;
-  msg += `║ 🔮 Dự đoán phiên <b>${data.nextPhien}</b>:\n\n`;
 
-  const diceMap = ['⚀','⚁','⚂','⚃','⚄','⚅'];
-  const diceStr = data.dice.map(d => diceMap[d-1] || '?').join(' ');
-  msg += `╠══ Phiên vừa xong ══\n`;
-  msg += `║ 🎲 ${diceStr} = <b>${data.tong}</b>\n`;
-  if (data.actual) {
-    const actIcon = data.actual === 'Tài' ? '🟢' : '🔴';
-    msg += `║ Kết quả: ${actIcon} <b>${data.actual === 'Tài' ? 'TÀI' : 'XỈU'}</b>\n`;
+  if (data.phien) msg += `║ Phiên: <b>${data.phien}</b>\n`;
+
+  // Dữ liệu từ V2 (xúc xắc phiên trước)
+  if (data.dice && data.dice[0]) {
+    msg += `╠══ Phiên vừa xong ══\n`;
+    msg += `║ 🎲 ${diceStr(data.dice)} = <b>${data.tong}</b>\n`;
+    if (data.actual) {
+      const actIcon = data.actual === 'tai' ? '🟢' : '🔴';
+      msg += `║ Kết quả: ${actIcon} <b>${data.actual === 'tai' ? 'TÀI' : 'XỈU'}</b>\n`;
+    }
   }
 
+  // Dữ liệu cược từ V1
   if (data.taiPeople !== undefined) {
     const total = (data.taiPeople + data.xiuPeople) || 1;
-    const tPct = Math.round(data.taiPeople / total * 100);
-    const xPct = 100 - tPct;
+    const tPct  = Math.round(data.taiPeople / total * 100);
+    const xPct  = 100 - tPct;
     msg += `╠══ Dữ liệu cược ══\n`;
     msg += `║ 👥 Tài: ${data.taiPeople} (${tPct}%) | Xỉu: ${data.xiuPeople} (${xPct}%)\n`;
     if (data.taiMoney) {
       const totalM = (data.taiMoney + data.xiuMoney) || 1;
-      const tmPct = Math.round(data.taiMoney / totalM * 100);
-      const fm = n => n >= 1e9 ? (n/1e9).toFixed(1)+'B' : n >= 1e6 ? (n/1e6).toFixed(1)+'M' : n >= 1e3 ? (n/1e3).toFixed(0)+'K' : String(n);
-      msg += `║ 💰 Tài: ${fm(data.taiMoney)} (${tmPct}%) | Xỉu: ${fm(data.xiuMoney)} (${100-tmPct}%)\n`;
+      const tmPct  = Math.round(data.taiMoney / totalM * 100);
+      msg += `║ 💰 Tài: ${fmtMoney(data.taiMoney)} (${tmPct}%) | Xỉu: ${fmtMoney(data.xiuMoney)} (${100-tmPct}%)\n`;
     }
   }
 
-  if (streakAnalysis && streakAnalysis.total >= 5) {
-    msg += `╠══ PHÂN TÍCH CẦU ══\n`;
-    msg += `║ 📊 Cầu hiện tại: <b>${streakAnalysis.cur} ×${streakAnalysis.streak}</b>\n`;
-    msg += `║ 🔄 Tỉ lệ bẻ cầu lịch sử: <b>${streakAnalysis.breakRate.toFixed(1)}%</b>\n`;
-    if (streakAnalysis.streak >= 4) {
-      msg += `║ ⚠️ CẢNH BÁO: Chuỗi ${streakAnalysis.streak} dài → khả năng bẻ cao!\n`;
-    }
-  }
+  // V3 note
+  if (data.v3Note) msg += `║ 💡 ${data.v3Note}\n`;
 
-  if (userStats && userStats.total) {
-    const acc = Math.round((userStats.correct || 0) / userStats.total * 100);
-    msg += `╠══ THỐNG KÊ CÁ NHÂN ══\n`;
-    msg += `║ 🎯 Độ chính xác: ${acc}% (${userStats.correct}/${userStats.total})\n`;
+  // Phân tích cầu
+  if (histStats && histStats.total >= 5) {
+    const bPct = Math.round(histStats.breakRate * 100);
+    const strVal = histStats.streakVal === 'tai' ? 'TÀI' : 'XỈU';
+    msg += `╠══ Phân tích cầu ══\n`;
+    msg += `║ 📊 Cầu: <b>${strVal} ×${histStats.streak}</b>\n`;
+    msg += `║ 🔄 Tỉ lệ bẻ: <b>${bPct}%</b>\n`;
+    if (histStats.accuracy !== null) {
+      msg += `║ ✅ Độ chính xác AI: <b>${Math.round(histStats.accuracy*100)}%</b> (${histStats.total} ván)\n`;
+    }
   }
 
   msg += `╚══════════════════\n`;
-  msg += `<i>⏱ ${new Date().toLocaleString('vi-VN')} | ${isTai ? '⬆️' : '⬇️'} ${conf < 55 ? 'Tín hiệu yếu' : conf < 65 ? 'Tín hiệu trung bình' : 'Tín hiệu mạnh'}</i>`;
+  msg += `<i>⏱ ${ts()} | ${isTai ? '⬆️' : '⬇️'} ${conf < 55 ? 'Tín hiệu yếu' : conf < 65 ? 'Tín hiệu trung bình' : 'Tín hiệu mạnh'}</i>`;
+
   return msg;
 }
 
-// ========== BOT ==========
-const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
-bot.on('polling_error', e => console.error('Polling error:', e.message));
-
-const rateCache = new NodeCache({ stdTTL: 60 });
-
-async function checkActive(uid) {
-  const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
-  if (!user || user.key_expires < Date.now()) return null;
-  return user;
+function fmtMoney(n) {
+  if (n >= 1e9) return (n/1e9).toFixed(1) + 'B';
+  if (n >= 1e6) return (n/1e6).toFixed(1) + 'M';
+  if (n >= 1e3) return (n/1e3).toFixed(0) + 'K';
+  return String(n);
 }
 
-// Lệnh user
-bot.onText(/\/start/, async (msg) => {
-  const uid = msg.chat.id;
-  const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
-  if (user && user.key_expires > Date.now()) {
-    bot.sendMessage(uid, `🔐 BẠN ĐÃ KÍCH HOẠT\n⏰ Hết hạn: ${formatExpiry(user.key_expires)}\n\n📌 /now - Dự đoán ngay\n📌 /startbot - Bật auto 30s\n📌 /stop - Tắt auto\n📌 /stats - Thống kê\n📌 /V1 /V2 /V3 - Chọn nguồn`, { parse_mode: 'HTML' });
-  } else {
-    bot.sendMessage(uid, `🔐 CHÀO MỪNG ĐẾN LC79 PREDICTOR\n\nNhập KEY để kích hoạt: /key MÃ_KEY\n\n💡 Chưa có key? Liên hệ admin @mdlvepa`, { parse_mode: 'HTML' });
-  }
-});
+// ═══════════════════════════════════════════════════════
+//  BOT INIT
+// ═══════════════════════════════════════════════════════
+log.info('Khởi động bot...');
+const bot = new TelegramBot(CONFIG.BOT_TOKEN, { polling: true });
 
-bot.onText(/\/key\s+(.+)/, async (msg, match) => {
-  const uid = String(msg.chat.id);
-  const code = match[1].trim().toUpperCase();
-  const keyData = await db.getAsync('SELECT * FROM keys WHERE code = ?', code);
-  if (!keyData) { bot.sendMessage(uid, '❌ Key không hợp lệ.'); return; }
-  if (keyData.expires && keyData.expires < Date.now()) { bot.sendMessage(uid, '⛔ Key đã hết hạn.'); return; }
-  if (keyData.usedBy && keyData.usedBy !== uid) { bot.sendMessage(uid, '⚠️ Key đã được dùng.'); return; }
+bot.on('polling_error', (e) => log.error('Polling error:', e.message));
+bot.on('error', (e) => log.error('Bot error:', e.message));
 
-  await db.runAsync('UPDATE keys SET usedBy = ? WHERE code = ?', uid, code);
-  await db.runAsync(`INSERT OR REPLACE INTO users (id, first_name, last_name, username, key, key_expires, source, auto_on, activated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-    uid, msg.from.first_name || '', msg.from.last_name || '', msg.from.username || '',
-    code, keyData.expires, 3, 0, Date.now()
-  );
-  bot.sendMessage(uid, `✅ Kích hoạt thành công!\n🔑 Key: <code>${code}</code>\n⏰ Hạn: ${formatExpiry(keyData.expires)}\n📡 Nguồn mặc định: V3`, { parse_mode: 'HTML' });
-  if (CONFIG.ADMIN_ID) {
-    bot.sendMessage(CONFIG.ADMIN_ID, `🔔 User mới kích hoạt key!\n👤 ${msg.from.first_name || ''} ${msg.from.last_name || ''} (@${msg.from.username || 'N/A'})\n🆔 ID: ${uid}\n🔑 Key: <code>${code}</code>`, { parse_mode: 'HTML' });
-  }
-});
+// ═══════════════════════════════════════════════════════
+//  MIDDLEWARE — kiểm tra admin
+// ═══════════════════════════════════════════════════════
+function isAdmin(chatId) {
+  return String(chatId) === String(CONFIG.ADMIN_ID);
+}
 
-bot.onText(/\/now/, async (msg) => {
-  const uid = String(msg.chat.id);
-  if (rateCache.get(uid)) return bot.sendMessage(uid, '⏳ Bạn đã dùng lệnh gần đây, vui lòng chờ.');
-  rateCache.set(uid, true);
-
-  const user = await checkActive(uid);
-  if (!user) { bot.sendMessage(uid, '🔐 Chưa kích hoạt. Dùng /key MÃ_KEY'); return; }
-
-  try {
-    const source = user.source === 1 ? 'V1' : (user.source === 2 ? 'V2' : 'V3');
-    const data = await getPredictionBySource(source);
-    const userStats = await getUserStats(uid);
-    const streakAnalysis = await getStreakAnalysis();
-    const msgText = formatPrediction(data, userStats, streakAnalysis);
-    bot.sendMessage(uid, msgText, { parse_mode: 'HTML' });
-    if (data.actual) {
-      await updateHistory(data.phien, data.actual, data.prediction, data.confidence, data.source);
-      await updateUserStats(uid, data.prediction, data.actual);
-    }
-  } catch(e) {
-    bot.sendMessage(uid, '⚠️ Lỗi API, thử lại sau');
-    console.error(e);
-  }
-});
-
-[1,2,3].forEach(v => {
-  bot.onText(new RegExp(`^\\/V${v}$`), async (msg) => {
-    const uid = String(msg.chat.id);
-    const user = await checkActive(uid);
-    if (!user) return;
-    await db.runAsync('UPDATE users SET source = ? WHERE id = ?', v, uid);
-    const desc = { 1: 'V1 — Dữ liệu cược', 2: 'V2 — AI LC79', 3: 'V3 — Kết hợp + phân tích cầu' };
-    bot.sendMessage(uid, `✅ Đã chuyển sang <b>${desc[v]}</b>`, { parse_mode: 'HTML' });
-  });
-});
-
-bot.onText(/\/startbot/, async (msg) => {
-  const uid = String(msg.chat.id);
-  const user = await checkActive(uid);
-  if (!user) return;
-  await db.runAsync('UPDATE users SET auto_on = 1 WHERE id = ?', uid);
-  startUserAuto(uid);
-  bot.sendMessage(uid, '▶️ Đã bật auto! Dự đoán mỗi 30 giây. Dùng /stop để tắt.', { parse_mode: 'HTML' });
-});
-
-bot.onText(/\/stop/, async (msg) => {
-  const uid = String(msg.chat.id);
-  await db.runAsync('UPDATE users SET auto_on = 0 WHERE id = ?', uid);
-  stopUserAuto(uid);
-  bot.sendMessage(uid, '⏹ Đã tắt auto. Dùng /now để xem ngay.', { parse_mode: 'HTML' });
-});
-
-bot.onText(/\/stats/, async (msg) => {
-  const uid = String(msg.chat.id);
-  const user = await checkActive(uid);
-  if (!user) return;
-  const stats = await getUserStats(uid);
-  const streak = await getStreakAnalysis();
-  let text = `📊 THỐNG KÊ CỦA BẠN\n\n📡 Nguồn: V${user.source || 3}\n▶️ Auto: ${user.auto_on ? 'Bật' : 'Tắt'}\n⏰ Key: ${formatExpiry(user.key_expires)}\n\n`;
-  if (stats && stats.total) {
-    const acc = Math.round((stats.correct || 0) / stats.total * 100);
-    text += `🎯 Độ chính xác: ${acc}%\n📈 Đúng: ${stats.correct}/${stats.total}\n\n`;
-  } else {
-    text += `📈 Chưa có dữ liệu thống kê\n\n`;
-  }
-  if (streak && streak.total >= 5) {
-    text += `📊 PHÂN TÍCH CẦU\n🔄 Cầu hiện tại: <b>${streak.cur} ×${streak.streak}</b>\n🔀 Tỉ lệ bẻ cầu: <b>${streak.breakRate.toFixed(1)}%</b>\n`;
-    if (streak.streak >= 4) text += `⚠️ Chuỗi dài → khả năng bẻ cao!\n`;
-  }
-  bot.sendMessage(uid, text, { parse_mode: 'HTML' });
-});
-
-bot.onText(/\/help/, async (msg) => {
-  const uid = msg.chat.id;
-  const user = await checkActive(uid);
-  let text = `📖 HƯỚNG DẪN\n/key MÃ - Kích hoạt\n/now - Dự đoán ngay\n/startbot - Bật auto 30s\n/stop - Tắt auto\n/stats - Thống kê\n/V1 /V2 /V3 - Chọn nguồn`;
-  if (String(uid) === CONFIG.ADMIN_ID) {
-    text += `\n\n👑 LỆNH ADMIN\n/addkey tên [time] - Tạo key\n/delkey MÃ - Xóa key\n/keys - DS key\n/users - DS user\n/info [ID] - Chi tiết user\n/deluser ID - Xóa user\n/resetstats - Reset thống kê`;
-  }
-  bot.sendMessage(uid, text, { parse_mode: 'HTML' });
-});
-
-// ========== ADMIN COMMANDS ==========
 function requireAdmin(msg, fn) {
-  if (String(msg.chat.id) !== CONFIG.ADMIN_ID) { bot.sendMessage(msg.chat.id, '❌ Lệnh admin'); return; }
+  if (!isAdmin(msg.chat.id)) {
+    bot.sendMessage(msg.chat.id, '❌ Lệnh này chỉ dành cho admin.');
+    return;
+  }
   fn();
 }
 
-bot.onText(/\/addkey(?:\s+(.+))?/, (msg, match) => requireAdmin(msg, async () => {
-  const args = (match[1] || '').trim().split(/\s+/);
-  const name = args[0] || `KEY_${Date.now()}`;
-  const durStr = args[1] || '30d';
-  const dur = parseDuration(durStr);
-  if (!dur) { bot.sendMessage(msg.chat.id, '❌ Sai định dạng. Dùng: 1p,1h,1d,1t,1th'); return; }
-  const code = `${name.toUpperCase()}_${Math.random().toString(36).substr(2,6).toUpperCase()}`;
-  const expires = Date.now() + dur;
-  await db.runAsync(`INSERT INTO keys (code, name, created, expires, duration, createdBy) VALUES (?, ?, ?, ?, ?, ?)`, code, name, Date.now(), expires, durStr, msg.chat.id);
-  bot.sendMessage(msg.chat.id, `✅ Key: <code>${code}</code> - Hạn: ${formatExpiry(expires)}`, { parse_mode: 'HTML' });
-}));
+// ═══════════════════════════════════════════════════════
+//  KEY MANAGEMENT
+// ═══════════════════════════════════════════════════════
 
-bot.onText(/\/delkey\s+(.+)/, (msg, match) => requireAdmin(msg, async () => {
+/**
+ * /addkey [tên] [thời hạn]
+ * Ví dụ: /addkey VIP1 30d  →  key VIP1 hết hạn sau 30 ngày
+ *        /addkey TEST 2h   →  key TEST hết hạn sau 2 giờ
+ */
+bot.onText(/\/addkey(?:\s+(.+))?/, (msg, match) => {
+  requireAdmin(msg, () => {
+    const args = (match[1] || '').trim().split(/\s+/);
+    const name = args[0] || `KEY_${Date.now()}`;
+    const durStr = args[1] || '30d';
+    const dur = parseDuration(durStr);
+
+    if (!dur) {
+      bot.sendMessage(msg.chat.id, '❌ Định dạng thời gian không hợp lệ.\nVí dụ: 1p, 2h, 7d, 1t, 1th');
+      return;
+    }
+
+    // Tạo mã key ngẫu nhiên
+    const code = `${name.toUpperCase()}_${Math.random().toString(36).substr(2,6).toUpperCase()}`;
+    const expires = Date.now() + dur;
+
+    const keys = DB.keys;
+    keys[code] = {
+      name,
+      code,
+      created: Date.now(),
+      expires,
+      duration: durStr,
+      usedBy: null,  // userId nào đã dùng
+      createdBy: msg.chat.id,
+    };
+    DB.saveKeys(keys);
+
+    bot.sendMessage(msg.chat.id,
+      `✅ <b>Tạo key thành công!</b>\n\n` +
+      `🔑 Mã key: <code>${code}</code>\n` +
+      `👤 Tên: ${name}\n` +
+      `⏰ Thời hạn: ${durStr} → ${formatExpiry(expires)}\n\n` +
+      `<i>User kích hoạt bằng: /key ${code}</i>`,
+      { parse_mode: 'HTML' }
+    );
+    log.info(`Admin tạo key: ${code} (${durStr})`);
+  });
+});
+
+/**
+ * /delkey [mã_key]
+ */
+bot.onText(/\/delkey(?:\s+(.+))?/, (msg, match) => {
+  requireAdmin(msg, () => {
+    const code = (match[1] || '').trim().toUpperCase();
+    if (!code) {
+      bot.sendMessage(msg.chat.id, '❌ Cú pháp: /delkey MÃ_KEY');
+      return;
+    }
+    const keys = DB.keys;
+    if (!keys[code]) {
+      bot.sendMessage(msg.chat.id, `❌ Không tìm thấy key: ${code}`);
+      return;
+    }
+    const name = keys[code].name;
+    delete keys[code];
+    DB.saveKeys(keys);
+    bot.sendMessage(msg.chat.id, `✅ Đã xóa key <code>${code}</code> (${name})`, { parse_mode: 'HTML' });
+    log.info(`Admin xóa key: ${code}`);
+  });
+});
+
+/**
+ * /keys — Xem danh sách tất cả key
+ */
+bot.onText(/\/keys$/, (msg) => {
+  requireAdmin(msg, () => {
+    const keys = DB.keys;
+    const list = Object.values(keys);
+    if (list.length === 0) {
+      bot.sendMessage(msg.chat.id, '📭 Chưa có key nào.');
+      return;
+    }
+
+    let text = `🔑 <b>Danh sách Keys (${list.length})</b>\n\n`;
+    list.forEach((k, i) => {
+      const status = !k.expires || k.expires > Date.now()
+        ? (k.usedBy ? '🟢 Đã dùng' : '🟡 Chưa dùng')
+        : '🔴 Hết hạn';
+      text += `${i+1}. <code>${k.code}</code>\n`;
+      text += `   ${status} | ${k.name} | ${formatExpiry(k.expires)}\n`;
+      if (k.usedBy) text += `   👤 Dùng bởi: ${k.usedBy}\n`;
+      text += '\n';
+    });
+
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+  });
+});
+
+// ═══════════════════════════════════════════════════════
+//  USER MANAGEMENT
+// ═══════════════════════════════════════════════════════
+
+/**
+ * /users — Danh sách users
+ */
+bot.onText(/\/users$/, (msg) => {
+  requireAdmin(msg, () => {
+    const users = DB.users;
+    const list  = Object.values(users);
+    if (list.length === 0) {
+      bot.sendMessage(msg.chat.id, '📭 Chưa có user nào.'); return;
+    }
+
+    let text = `👥 <b>Danh sách Users (${list.length})</b>\n\n`;
+    list.forEach((u, i) => {
+      const active = u.keyExpires && u.keyExpires > Date.now();
+      const auto   = u.autoOn ? '▶️' : '⏹';
+      text += `${i+1}. ${active ? '🟢' : '🔴'} <b>${u.firstName || u.username || 'N/A'}</b> [${u.id}]\n`;
+      text += `   ${auto} V${u.source || 3} | ${formatExpiry(u.keyExpires)}\n\n`;
+    });
+
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+  });
+});
+
+/**
+ * /info [ID] — Chi tiết user
+ */
+bot.onText(/\/info(?:\s+(\d+))?/, (msg, match) => {
+  requireAdmin(msg, () => {
+    const uid = match[1] ? match[1] : String(msg.chat.id);
+    const users = DB.users;
+    const u = users[uid];
+    if (!u) { bot.sendMessage(msg.chat.id, `❌ Không tìm thấy user: ${uid}`); return; }
+
+    const stats = DB.stats;
+    const s = stats[uid] || {};
+
+    let text = `👤 <b>Thông tin User</b>\n\n`;
+    text += `🆔 ID: <code>${u.id}</code>\n`;
+    text += `👤 Tên: ${u.firstName || ''} ${u.lastName || ''}\n`;
+    text += `🏷 Username: @${u.username || 'N/A'}\n`;
+    text += `🔑 Key: <code>${u.key || 'N/A'}</code>\n`;
+    text += `⏰ Hạn key: ${formatExpiry(u.keyExpires)}\n`;
+    text += `📡 Nguồn: V${u.source || 3}\n`;
+    text += `▶️ Auto: ${u.autoOn ? 'Bật' : 'Tắt'}\n`;
+    text += `📅 Kích hoạt: ${u.activatedAt ? new Date(u.activatedAt).toLocaleString('vi') : 'N/A'}\n\n`;
+    text += `📊 <b>Thống kê</b>\n`;
+    text += `🎯 Tổng dự đoán: ${s.total || 0}\n`;
+    text += `✅ Đúng: ${s.correct || 0} (${s.total ? Math.round((s.correct||0)/s.total*100) : 0}%)\n`;
+    text += `🔄 Lần bẻ cầu đúng: ${s.breakCorrect || 0}\n`;
+
+    bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
+  });
+});
+
+/**
+ * /deluser [ID]
+ */
+bot.onText(/\/deluser\s+(\d+)/, (msg, match) => {
+  requireAdmin(msg, () => {
+    const uid = match[1];
+    const users = DB.users;
+    if (!users[uid]) { bot.sendMessage(msg.chat.id, `❌ User ${uid} không tồn tại`); return; }
+
+    const u = users[uid];
+    // Hủy auto nếu đang chạy
+    stopUserAuto(uid);
+    delete users[uid];
+    DB.saveUsers(users);
+
+    bot.sendMessage(msg.chat.id, `✅ Đã xóa user <b>${u.firstName || uid}</b> [${uid}]`, { parse_mode: 'HTML' });
+    log.info(`Admin xóa user: ${uid}`);
+  });
+});
+
+// ═══════════════════════════════════════════════════════
+//  USER COMMANDS
+// ═══════════════════════════════════════════════════════
+
+/**
+ * /start — Chào user
+ */
+bot.onText(/\/start$/, (msg) => {
+  const uid  = String(msg.chat.id);
+  const users = DB.users;
+  const u    = users[uid];
+  const active = u && u.keyExpires && u.keyExpires > Date.now();
+
+  let text = `🎮 <b>Chào mừng đến LC79 AI Bot!</b>\n\n`;
+
+  if (active) {
+    text += `✅ Tài khoản đang hoạt động\n`;
+    text += `⏰ Hết hạn: ${formatExpiry(u.keyExpires)}\n\n`;
+    text += `<b>Lệnh:</b>\n`;
+    text += `• /now — Xem dự đoán ngay\n`;
+    text += `• /startbot — Bật tự động nhận dự đoán\n`;
+    text += `• /stop — Tắt tự động\n`;
+    text += `• /stats — Xem thống kê\n`;
+    text += `• /V1 /V2 /V3 — Chọn nguồn dự đoán\n`;
+  } else {
+    text += `🔑 Để sử dụng, hãy kích hoạt key:\n`;
+    text += `<code>/key MÃ_KEY_CỦA_BẠN</code>\n\n`;
+    text += `📞 Liên hệ admin để mua key.`;
+  }
+
+  bot.sendMessage(uid, text, { parse_mode: 'HTML' });
+});
+
+/**
+ * /key [MÃ_KEY] — Kích hoạt key
+ */
+bot.onText(/\/key\s+(.+)/, async (msg, match) => {
+  const uid  = String(msg.chat.id);
   const code = match[1].trim().toUpperCase();
-  const key = await db.getAsync('SELECT * FROM keys WHERE code = ?', code);
-  if (!key) { bot.sendMessage(msg.chat.id, `❌ Không tìm thấy key ${code}`); return; }
-  await db.runAsync('DELETE FROM keys WHERE code = ?', code);
-  await db.runAsync('UPDATE users SET key = NULL, key_expires = NULL, auto_on = 0 WHERE key = ?', code);
-  bot.sendMessage(msg.chat.id, `✅ Đã xóa key ${code}`, { parse_mode: 'HTML' });
-}));
+  const keys = DB.keys;
+  const k    = keys[code];
 
-bot.onText(/\/keys/, (msg) => requireAdmin(msg, async () => {
-  const keys = await db.allAsync('SELECT * FROM keys ORDER BY created DESC');
-  if (keys.length === 0) { bot.sendMessage(msg.chat.id, '📭 Chưa có key.'); return; }
-  let text = '🔑 DANH SÁCH KEY\n\n';
-  for (const k of keys) {
-    const status = !k.expires || k.expires > Date.now() ? (k.usedBy ? '🟢 Đã dùng' : '🟡 Chưa dùng') : '🔴 Hết hạn';
-    text += `${k.code}\n   ${status} | ${k.name} | ${formatExpiry(k.expires)}\n`;
-    if (k.usedBy) text += `   👤 Dùng bởi: ${k.usedBy}\n`;
-    text += '\n';
+  if (!k) {
+    bot.sendMessage(uid, '❌ Key không hợp lệ hoặc không tồn tại.'); return;
   }
-  bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
-}));
-
-bot.onText(/\/users/, (msg) => requireAdmin(msg, async () => {
-  const users = await db.allAsync('SELECT * FROM users');
-  if (users.length === 0) { bot.sendMessage(msg.chat.id, '📭 Chưa có user.'); return; }
-  let text = '👥 DANH SÁCH USER\n\n';
-  for (const u of users) {
-    const active = u.key_expires && u.key_expires > Date.now();
-    const auto = u.auto_on ? '▶️' : '⏹';
-    text += `${active ? '🟢' : '🔴'} ${u.first_name || u.username || u.id} [${u.id}]\n   ${auto} V${u.source || 3} | ${formatExpiry(u.key_expires)}\n\n`;
+  if (k.expires && k.expires < Date.now()) {
+    bot.sendMessage(uid, '❌ Key này đã hết hạn.'); return;
   }
-  bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
-}));
+  if (k.usedBy && k.usedBy !== uid) {
+    bot.sendMessage(uid, '❌ Key này đã được sử dụng bởi người khác.'); return;
+  }
 
-bot.onText(/\/info(?:\s+(\d+))?/, (msg, match) => requireAdmin(msg, async () => {
-  const uid = match[1] || String(msg.chat.id);
-  const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
-  if (!user) { bot.sendMessage(msg.chat.id, `❌ Không tìm thấy user ${uid}`); return; }
-  const stats = await getUserStats(uid);
-  let text = `👤 THÔNG TIN USER\n\n🆔 ID: ${user.id}\n👤 Tên: ${user.first_name || ''} ${user.last_name || ''}\n🔑 Key: ${user.key || 'N/A'}\n⏰ Hạn: ${formatExpiry(user.key_expires)}\n📡 Nguồn: V${user.source || 3}\n▶️ Auto: ${user.auto_on ? 'Bật' : 'Tắt'}\n📅 Kích hoạt: ${user.activated_at ? formatVietnamTime(user.activated_at) : 'N/A'}\n\n📊 THỐNG KÊ\n🎯 Tổng: ${stats?.total || 0}\n✅ Đúng: ${stats?.correct || 0} (${stats?.total ? Math.round((stats.correct||0)/stats.total*100) : 0}%)`;
-  bot.sendMessage(msg.chat.id, text, { parse_mode: 'HTML' });
-}));
+  // Đánh dấu key đã dùng
+  k.usedBy = uid;
+  DB.saveKeys(keys);
 
-bot.onText(/\/deluser\s+(\d+)/, (msg, match) => requireAdmin(msg, async () => {
-  const uid = match[1];
-  const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
-  if (!user) { bot.sendMessage(msg.chat.id, `❌ User ${uid} không tồn tại`); return; }
+  // Lưu user
+  const users = DB.users;
+  users[uid] = {
+    id:          uid,
+    firstName:   msg.from.first_name || '',
+    lastName:    msg.from.last_name  || '',
+    username:    msg.from.username   || '',
+    key:         code,
+    keyExpires:  k.expires,
+    source:      3,    // mặc định V3
+    autoOn:      false,
+    activatedAt: Date.now(),
+  };
+  DB.saveUsers(users);
+
+  bot.sendMessage(uid,
+    `✅ <b>Kích hoạt thành công!</b>\n\n` +
+    `🔑 Key: <code>${code}</code>\n` +
+    `⏰ Hạn: ${formatExpiry(k.expires)}\n\n` +
+    `📡 Nguồn mặc định: <b>V3 (Thông minh)</b>\n\n` +
+    `<b>Bắt đầu:</b>\n` +
+    `• /now — Dự đoán ngay\n` +
+    `• /startbot — Tự động 60 giây`,
+    { parse_mode: 'HTML' }
+  );
+
+  log.ok(`User ${uid} (${msg.from.first_name}) kích hoạt key ${code}`);
+
+  // Thông báo admin
+  try {
+    await bot.sendMessage(CONFIG.ADMIN_ID,
+      `🔔 <b>User mới kích hoạt key!</b>\n\n` +
+      `👤 ${msg.from.first_name || ''} ${msg.from.last_name || ''} (@${msg.from.username || 'N/A'})\n` +
+      `🆔 ID: <code>${uid}</code>\n` +
+      `🔑 Key: <code>${code}</code>\n` +
+      `⏰ Hạn: ${formatExpiry(k.expires)}\n` +
+      `🕐 Lúc: ${ts()}`,
+      { parse_mode: 'HTML' }
+    );
+  } catch(e) { log.warn('Không gửi được thông báo admin:', e.message); }
+});
+
+/**
+ * /now — Lấy dự đoán ngay
+ */
+bot.onText(/\/now$/, async (msg) => {
+  const uid = String(msg.chat.id);
+  if (!checkActive(uid, msg)) return;
+
+  const u = DB.users[uid];
+  const loadingMsg = await bot.sendMessage(uid, '⏳ Đang lấy dữ liệu...', { parse_mode: 'HTML' });
+
+  try {
+    const data = await fetchBySource(`V${u.source || 3}`);
+    const hist = getHistoryStats();
+
+    // Cập nhật history nếu có kết quả thực
+    if (data.phien && data.actual) {
+      updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
+    }
+
+    const text = formatPrediction(data, hist);
+    await bot.editMessageText(text, {
+      chat_id: uid,
+      message_id: loadingMsg.message_id,
+      parse_mode: 'HTML',
+    });
+  } catch(e) {
+    log.error(`/now error for ${uid}:`, e.message);
+    await bot.editMessageText(`❌ Lỗi lấy dữ liệu: ${e.message}`, {
+      chat_id: uid,
+      message_id: loadingMsg.message_id,
+    });
+  }
+});
+
+/**
+ * /startbot — Bật auto gửi dự đoán
+ */
+bot.onText(/\/startbot$/, (msg) => {
+  const uid = String(msg.chat.id);
+  if (!checkActive(uid, msg)) return;
+
+  const users = DB.users;
+  users[uid].autoOn = true;
+  DB.saveUsers(users);
+
+  startUserAuto(uid);
+
+  bot.sendMessage(uid,
+    `▶️ <b>Đã bật auto!</b>\n` +
+    `Dự đoán sẽ được gửi mỗi <b>60 giây</b>.\n` +
+    `Dùng /stop để tắt.`,
+    { parse_mode: 'HTML' }
+  );
+  log.info(`User ${uid} bật auto`);
+});
+
+/**
+ * /stop — Tắt auto
+ */
+bot.onText(/\/stop$/, (msg) => {
+  const uid = String(msg.chat.id);
+
+  const users = DB.users;
+  if (users[uid]) { users[uid].autoOn = false; DB.saveUsers(users); }
+
   stopUserAuto(uid);
-  await db.runAsync('DELETE FROM users WHERE id = ?', uid);
-  if (user.key) await db.runAsync('UPDATE keys SET usedBy = NULL WHERE code = ?', user.key);
-  bot.sendMessage(msg.chat.id, `✅ Đã xóa user ${user.first_name || uid}`, { parse_mode: 'HTML' });
-  try { await bot.sendMessage(uid, `⛔ Tài khoản đã bị admin xóa.`); } catch(e) {}
-}));
+  bot.sendMessage(uid, '⏹ <b>Đã tắt auto.</b>\nDùng /now để lấy dự đoán thủ công.', { parse_mode: 'HTML' });
+  log.info(`User ${uid} tắt auto`);
+});
 
-bot.onText(/\/resetstats/, (msg) => requireAdmin(msg, async () => {
-  await db.runAsync('DELETE FROM stats');
-  await db.runAsync('DELETE FROM history');
-  bot.sendMessage(msg.chat.id, '✅ Đã reset thống kê.');
-}));
+/**
+ * /stats — Xem thống kê cá nhân
+ */
+bot.onText(/\/stats$/, (msg) => {
+  const uid = String(msg.chat.id);
+  if (!checkActive(uid, msg)) return;
 
-// ========== AUTO SEND ==========
-const autoTimers = {};
-let lastSentPhien = 0;
+  const users = DB.users;
+  const stats = DB.stats;
+  const u = users[uid];
+  const s = stats[uid] || {};
+  const hist = getHistoryStats();
 
-async function startUserAuto(uid) {
-  if (autoTimers[uid]) clearInterval(autoTimers[uid]);
+  let text = `📊 <b>Thống kê của bạn</b>\n\n`;
+  text += `📡 Nguồn: <b>V${u.source || 3}</b>\n`;
+  text += `▶️ Auto: ${u.autoOn ? 'Đang bật' : 'Đang tắt'}\n`;
+  text += `⏰ Key: ${formatExpiry(u.keyExpires)}\n\n`;
+
+  if (s.total) {
+    const acc = Math.round((s.correct || 0) / s.total * 100);
+    text += `🎯 <b>Độ chính xác AI: ${acc}%</b>\n`;
+    text += `📈 Tổng dự đoán: ${s.total}\n`;
+    text += `✅ Đúng: ${s.correct || 0} | ❌ Sai: ${s.total - (s.correct||0)}\n\n`;
+  } else {
+    text += `📈 Chưa có dữ liệu thống kê\n\n`;
+  }
+
+  if (hist) {
+    const bPct = Math.round(hist.breakRate * 100);
+    text += `📊 <b>Phân tích cầu (${hist.total} ván)</b>\n`;
+    text += `🔄 Cầu hiện tại: <b>${hist.streakVal === 'tai' ? 'TÀI' : 'XỈU'} ×${hist.streak}</b>\n`;
+    text += `🔀 Tỉ lệ bẻ cầu: <b>${bPct}%</b>\n`;
+    if (hist.accuracy !== null) {
+      text += `🤖 Độ chính xác global: <b>${Math.round(hist.accuracy*100)}%</b>\n`;
+    }
+  }
+
+  bot.sendMessage(uid, text, { parse_mode: 'HTML' });
+});
+
+/**
+ * /V1, /V2, /V3 — Chọn nguồn dự đoán
+ */
+[1, 2, 3].forEach(v => {
+  bot.onText(new RegExp(`^\\/V${v}$`), (msg) => {
+    const uid = String(msg.chat.id);
+    if (!checkActive(uid, msg)) return;
+
+    const users = DB.users;
+    users[uid].source = v;
+    DB.saveUsers(users);
+
+    const desc = {
+      1: 'V1 — Phân tích dữ liệu cược (người + tiền)',
+      2: 'V2 — Dự đoán ML từ API',
+      3: 'V3 — Kết hợp thông minh V1+V2',
+    };
+    bot.sendMessage(uid, `✅ Đã chuyển sang <b>${desc[v]}</b>`, { parse_mode: 'HTML' });
+    log.info(`User ${uid} chuyển sang V${v}`);
+  });
+});
+
+/**
+ * /help
+ */
+bot.onText(/\/help$/, (msg) => {
+  const uid = String(msg.chat.id);
+  let text = `📖 <b>Hướng dẫn sử dụng</b>\n\n`;
+  text += `<b>Lệnh user:</b>\n`;
+  text += `• /key MÃ → Kích hoạt key\n`;
+  text += `• /now → Dự đoán ngay\n`;
+  text += `• /startbot → Bật auto 60s\n`;
+  text += `• /stop → Tắt auto\n`;
+  text += `• /stats → Thống kê cá nhân\n`;
+  text += `• /V1 /V2 /V3 → Chọn nguồn\n\n`;
+
+  if (isAdmin(uid)) {
+    text += `<b>Lệnh admin:</b>\n`;
+    text += `• /addkey tên [thời gian] → Tạo key\n`;
+    text += `  Thời gian: 1p 2h 7d 1t 1th\n`;
+    text += `• /delkey MÃ → Xóa key\n`;
+    text += `• /keys → Danh sách key\n`;
+    text += `• /users → Danh sách user\n`;
+    text += `• /info [ID] → Chi tiết user\n`;
+    text += `• /deluser ID → Xóa user\n`;
+  }
+
+  bot.sendMessage(uid, text, { parse_mode: 'HTML' });
+});
+
+// ═══════════════════════════════════════════════════════
+//  AUTO SEND SYSTEM
+// ═══════════════════════════════════════════════════════
+const autoTimers = {}; // { userId: intervalId }
+
+function startUserAuto(uid) {
+  stopUserAuto(uid); // dừng cũ nếu có
+
   autoTimers[uid] = setInterval(async () => {
-    const user = await db.getAsync('SELECT * FROM users WHERE id = ?', uid);
-    if (!user || !user.auto_on) { stopUserAuto(uid); return; }
-    if (user.key_expires < Date.now()) {
+    const users = DB.users;
+    const u = users[uid];
+
+    // Kiểm tra vẫn active và auto bật
+    if (!u || !u.autoOn) { stopUserAuto(uid); return; }
+
+    // Kiểm tra key còn hạn
+    if (u.keyExpires && u.keyExpires < Date.now()) {
       stopUserAuto(uid);
-      await db.runAsync('UPDATE users SET auto_on = 0 WHERE id = ?', uid);
-      bot.sendMessage(uid, '⛔ Key hết hạn! Auto tắt.', { parse_mode: 'HTML' });
+      u.autoOn = false;
+      DB.saveUsers(users);
+      try {
+        bot.sendMessage(uid, '⛔ <b>Key của bạn đã hết hạn!</b>\nAuto đã tắt. Liên hệ admin để gia hạn.', { parse_mode: 'HTML' });
+        bot.sendMessage(CONFIG.ADMIN_ID, `⚠️ Key hết hạn: User ${u.firstName || uid} [${uid}]`, { parse_mode: 'HTML' });
+      } catch(e) {}
       return;
     }
 
     try {
-      const source = user.source === 1 ? 'V1' : (user.source === 2 ? 'V2' : 'V3');
-      const data = await getPredictionBySource(source);
-      if (lastSentPhien === data.nextPhien) return;
-      lastSentPhien = data.nextPhien;
+      const data = await fetchBySource(`V${u.source || 3}`);
+      const hist = getHistoryStats();
 
-      const userStats = await getUserStats(uid);
-      const streakAnalysis = await getStreakAnalysis();
-      const msgText = formatPrediction(data, userStats, streakAnalysis);
-      bot.sendMessage(uid, msgText, { parse_mode: 'HTML' });
-      if (data.actual) {
-        await updateHistory(data.phien, data.actual, data.prediction, data.confidence, data.source);
-        await updateUserStats(uid, data.prediction, data.actual);
+      if (data.phien && data.actual) {
+        updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
       }
-    } catch(e) { console.error(`Auto error ${uid}:`, e.message); }
+
+      const text = formatPrediction(data, hist);
+      await bot.sendMessage(uid, text, { parse_mode: 'HTML' });
+    } catch(e) {
+      log.error(`Auto send error for ${uid}:`, e.message);
+    }
   }, CONFIG.AUTO_INTERVAL);
+
+  log.info(`Bắt đầu auto cho user ${uid}`);
 }
 
 function stopUserAuto(uid) {
-  if (autoTimers[uid]) { clearInterval(autoTimers[uid]); delete autoTimers[uid]; }
-}
-
-async function restoreAutoUsers() {
-  const users = await db.allAsync('SELECT id FROM users WHERE auto_on = 1 AND key_expires > ?', Date.now());
-  for (const u of users) startUserAuto(u.id);
-  console.log(`Restored auto for ${users.length} users`);
-}
-
-// ========== BACKUP ==========
-function backupDatabase() {
-  try {
-    const src = CONFIG.DB_PATH;
-    const dest = path.join(CONFIG.BACKUP_DIR, `lc79_${new Date().toISOString().slice(0,10)}.db`);
-    fs.copyFileSync(src, dest);
-    console.log(`📁 Backup: ${dest}`);
-  } catch(e) {}
-}
-setInterval(backupDatabase, 24 * 60 * 60 * 1000);
-
-// ========== HTTP SERVER & SELF PING (giữ bot không sleep) ==========
-const server = http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain' });
-  res.end('Bot is alive');
-  console.log(`✅ Ping received at ${new Date().toISOString()}`);
-});
-server.listen(CONFIG.PORT, () => {
-  console.log(`🌐 Health check server running on port ${CONFIG.PORT}`);
-});
-
-// Tự ping chính nó mỗi 60 giây
-setInterval(() => {
-  const options = {
-    hostname: 'localhost',
-    port: CONFIG.PORT,
-    path: '/',
-    method: 'GET',
-    timeout: 5000
-  };
-  const req = http.request(options, (res) => {
-    console.log(`✅ Self ping OK at ${new Date().toISOString()}`);
-  });
-  req.on('error', (e) => console.log(`❌ Self ping error: ${e.message}`));
-  req.end();
-}, 60000);
-
-// ========== KHỞI ĐỘNG ==========
-(async () => {
-  try {
-    await initDB();
-    await restoreAutoUsers();
-    console.log('✅ Bot đã khởi động!');
-    if (CONFIG.ADMIN_ID) {
-      bot.sendMessage(CONFIG.ADMIN_ID, `🟢 Bot LC79 đã online!\n🌐 Health check: http://localhost:${CONFIG.PORT}\n⏰ Auto ping mỗi 60 giây`, { parse_mode: 'HTML' }).catch(()=>{});
-    }
-  } catch (err) {
-    console.error('❌ Khởi động thất bại:', err);
+  if (autoTimers[uid]) {
+    clearInterval(autoTimers[uid]);
+    delete autoTimers[uid];
+    log.info(`Dừng auto cho user ${uid}`);
   }
-})();
+}
+
+// Khởi động lại auto cho users đã bật trước đó
+function restoreAutoUsers() {
+  const users = DB.users;
+  let count = 0;
+  for (const [uid, u] of Object.entries(users)) {
+    if (u.autoOn && u.keyExpires && u.keyExpires > Date.now()) {
+      startUserAuto(uid);
+      count++;
+    }
+  }
+  if (count > 0) log.info(`Khôi phục auto cho ${count} user`);
+}
+
+// ═══════════════════════════════════════════════════════
+//  HELPER: kiểm tra user có active không
+// ═══════════════════════════════════════════════════════
+function checkActive(uid, msg) {
+  const users = DB.users;
+  const u = users[uid];
+  if (!u || !u.keyExpires || u.keyExpires < Date.now()) {
+    bot.sendMessage(uid,
+      '❌ Tài khoản chưa kích hoạt hoặc key đã hết hạn.\nDùng /key MÃ_KEY để kích hoạt.',
+      { parse_mode: 'HTML' }
+    );
+    return false;
+  }
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════
+//  KEY EXPIRY CHECKER — chạy mỗi 5 phút
+// ═══════════════════════════════════════════════════════
+setInterval(() => {
+  const keys = DB.keys;
+  let expired = [];
+  for (const [code, k] of Object.entries(keys)) {
+    if (k.expires && k.expires < Date.now() && !k.notifiedExpiry) {
+      k.notifiedExpiry = true;
+      expired.push(code);
+    }
+  }
+  if (expired.length > 0) {
+    DB.saveKeys(keys);
+    log.info(`Keys hết hạn: ${expired.join(', ')}`);
+    try {
+      bot.sendMessage(CONFIG.ADMIN_ID,
+        `⚠️ <b>${expired.length} key vừa hết hạn:</b>\n${expired.map(c => `• <code>${c}</code>`).join('\n')}`,
+        { parse_mode: 'HTML' }
+      );
+    } catch(e) {}
+  }
+}, 5 * 60 * 1000);
+
+// ═══════════════════════════════════════════════════════
+//  EXPRESS SERVER — giữ bot sống trên Render
+// ═══════════════════════════════════════════════════════
+const app = express();
+app.use(express.json());
+
+app.get('/', (req, res) => {
+  const users = DB.users;
+  const activeCount = Object.values(users).filter(u => u.keyExpires && u.keyExpires > Date.now()).length;
+  res.json({
+    status: 'running',
+    uptime: Math.round(process.uptime()) + 's',
+    activeUsers: activeCount,
+    autoUsers: Object.keys(autoTimers).length,
+    time: ts(),
+  });
+});
+
+app.get('/health', (req, res) => res.send('OK'));
+
+app.listen(CONFIG.PORT, () => {
+  log.ok(`Express server chạy trên port ${CONFIG.PORT}`);
+});
+
+// ═══════════════════════════════════════════════════════
+//  KHỞI ĐỘNG
+// ═══════════════════════════════════════════════════════
+restoreAutoUsers();
+
+log.ok('✅ Bot đã khởi động thành công!');
+log.info(`Admin ID: ${CONFIG.ADMIN_ID}`);
+
+// Thông báo admin bot đã online
+try {
+  bot.sendMessage(CONFIG.ADMIN_ID, `🟢 <b>Bot LC79 đã online!</b>\n🕐 ${ts()}`, { parse_mode: 'HTML' });
+} catch(e) {}
+
+// Xử lý lỗi không bắt được
+process.on('uncaughtException',  (e) => log.error('uncaughtException:', e.message));
+process.on('unhandledRejection', (e) => log.error('unhandledRejection:', e));
