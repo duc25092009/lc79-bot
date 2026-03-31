@@ -1,6 +1,5 @@
 /**
- * LC79 Tài Xỉu Bot – Ultimate Edition (ĐÃ SỬA LỖI)
- * - SQLite database, cache 3s, trọng số động, RSI, dashboard, backup, webhook
+ * LC79 Tài Xỉu Bot – Ultimate Edition (Đã sửa lỗi DB và tối ưu phiên)
  */
 
 'use strict';
@@ -27,7 +26,7 @@ const CONFIG = {
   BACKUP_DIR:   './backups',
   AUTO_INTERVAL: 60000,      // 60 giây
   API_TIMEOUT:   6000,       // 6 giây timeout
-  CACHE_TTL:     3,          // Cache 3 giây (đủ nhanh)
+  CACHE_TTL:     2,          // Cache 2 giây – rất nhanh
   MAX_HISTORY:   500,
 };
 
@@ -37,8 +36,6 @@ if (!fs.existsSync(CONFIG.BACKUP_DIR)) fs.mkdirSync(CONFIG.BACKUP_DIR, { recursi
 
 // ========== CACHE ==========
 const apiCache = new NodeCache({ stdTTL: CONFIG.CACHE_TTL });
-let globalPredictionData = null;     // Cache dữ liệu dự đoán cho tất cả user trong 1 phiên
-let lastGlobalFetch = 0;
 
 // ========== SQLITE ==========
 const db = new sqlite3.Database(CONFIG.DB_PATH);
@@ -94,12 +91,8 @@ async function initDB() {
       ts INTEGER
     )
   `);
-  await db.runAsync(`
-    CREATE INDEX IF NOT EXISTS idx_history_phien ON history(phien)
-  `);
-  await db.runAsync(`
-    CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)
-  `);
+  await db.runAsync(`CREATE INDEX IF NOT EXISTS idx_history_phien ON history(phien)`);
+  await db.runAsync(`CREATE INDEX IF NOT EXISTS idx_history_ts ON history(ts)`);
   await db.runAsync(`
     CREATE TABLE IF NOT EXISTS predictions (
       user_id TEXT,
@@ -281,21 +274,11 @@ async function fetchV3Dynamic() {
   return { ...v1Ok, source: 'V3(Dyn→V1)', dynamicNote: `V1 trọng số ${Math.round(weights.v1Weight*100)}%` };
 }
 
-// Hàm lấy dữ liệu chung (có cache global)
-async function getGlobalPrediction(source = 'V3') {
-  const now = Date.now();
-  if (globalPredictionData && (now - lastGlobalFetch < 5000)) {
-    // Dùng cache 5 giây để tránh gọi quá nhiều
-    return globalPredictionData;
-  }
-  let data;
-  if (source === 'V1') data = await fetchV1();
-  else if (source === 'V2') data = await fetchV2();
-  else data = await fetchV3Dynamic();
-
-  globalPredictionData = data;
-  lastGlobalFetch = now;
-  return data;
+// Hàm lấy dữ liệu theo nguồn (không cache global)
+async function fetchBySource(source) {
+  if (source === 'V1') return fetchV1();
+  if (source === 'V2') return fetchV2();
+  return fetchV3Dynamic();
 }
 
 // ========== HÀM TIỆN ÍCH ==========
@@ -399,7 +382,7 @@ async function updateUserStats(userId, prediction, actual) {
   `, userId, correct);
 }
 
-function formatPrediction(data, histStats, userStats, breakAnalysis, lang = 'vi') {
+function formatPrediction(data, nextPhien, histStats, userStats, breakAnalysis, lang = 'vi') {
   i18n.setLocale(lang);
   const isTai = data.result === 'Tài';
   const icon = isTai ? '🟢' : '🔴';
@@ -412,7 +395,8 @@ function formatPrediction(data, histStats, userStats, breakAnalysis, lang = 'vi'
   msg += `║ ${bar}\n`;
   msg += `║ Nguồn: <b>${data.source}</b>\n`;
 
-  if (data.phien) msg += `║ Phiên: <b>${data.phien}</b>\n`;
+  if (data.phien) msg += `║ Phiên hiện tại: <b>${data.phien}</b>\n`;
+  msg += `║ Dự đoán phiên <b>${nextPhien}</b>:\n`;
 
   if (data.dice && data.dice[0]) {
     const diceStr = data.dice.map(d => ['⚀','⚁','⚂','⚃','⚄','⚅'][d-1] || '?').join(' ');
@@ -536,9 +520,7 @@ bot.onText(/\/now/, async (msg) => {
   const source = `V${user.source || 3}`;
   let data;
   try {
-    if (source === 'V1') data = await fetchV1();
-    else if (source === 'V2') data = await fetchV2();
-    else data = await fetchV3Dynamic();
+    data = await fetchBySource(source);
   } catch(e) {
     bot.sendMessage(uid, i18n.__({phrase: 'error_api', locale: user.lang}), { parse_mode: 'HTML' });
     return;
@@ -548,11 +530,12 @@ bot.onText(/\/now/, async (msg) => {
     await updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
   }
 
+  const nextPhien = data.phien + 1;
   const histStats = await getHistoryStats();
   const historyForBreak = await db.allAsync('SELECT actual FROM history ORDER BY ts DESC LIMIT 20');
   const breakAnalysis = advancedBreakAnalysis(historyForBreak);
   const userStats = await db.getAsync('SELECT total, correct FROM stats WHERE user_id = ?', uid);
-  const msgText = formatPrediction(data, histStats, userStats, breakAnalysis, user.lang);
+  const msgText = formatPrediction(data, nextPhien, histStats, userStats, breakAnalysis, user.lang);
   bot.sendMessage(uid, msgText, { parse_mode: 'HTML' });
   await db.runAsync(
     `INSERT INTO predictions (user_id, phien, prediction, confidence, source, ts) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -735,6 +718,7 @@ bot.onText(/\/resetstats/, (msg) => requireAdmin(msg, async () => {
 
 // ========== AUTO SEND ==========
 const autoTimers = {};
+let lastGlobalPhien = 0;
 
 async function startUserAuto(uid) {
   if (autoTimers[uid]) clearInterval(autoTimers[uid]);
@@ -748,6 +732,16 @@ async function startUserAuto(uid) {
       return;
     }
 
+    // Lấy phiên mới nhất (dùng V1 để có phien)
+    let v1;
+    try { v1 = await fetchV1(); } catch(e) { return; }
+    if (!v1) return;
+    const currentPhien = v1.phien;
+
+    // Chỉ gửi khi phiên thay đổi
+    if (lastGlobalPhien === currentPhien) return;
+    lastGlobalPhien = currentPhien;
+
     const source = `V${user.source || 3}`;
     let data;
     try {
@@ -759,11 +753,12 @@ async function startUserAuto(uid) {
     if (data.phien && data.actual) {
       await updateHistory(data.phien, data.actual, data.result, data.conf, data.source);
     }
+    const nextPhien = data.phien + 1;
     const histStats = await getHistoryStats();
     const historyForBreak = await db.allAsync('SELECT actual FROM history ORDER BY ts DESC LIMIT 20');
     const breakAnalysis = advancedBreakAnalysis(historyForBreak);
     const userStats = await db.getAsync('SELECT total, correct FROM stats WHERE user_id = ?', uid);
-    const msgText = formatPrediction(data, histStats, userStats, breakAnalysis, user.lang);
+    const msgText = formatPrediction(data, nextPhien, histStats, userStats, breakAnalysis, user.lang);
     bot.sendMessage(uid, msgText, { parse_mode: 'HTML' });
     await db.runAsync(
       `INSERT INTO predictions (user_id, phien, prediction, confidence, source, ts) VALUES (?, ?, ?, ?, ?, ?)`,
@@ -778,9 +773,11 @@ function stopUserAuto(uid) {
 }
 
 async function restoreAutoUsers() {
-  const users = await db.allAsync('SELECT id FROM users WHERE auto_on = 1 AND key_expires > ?', Date.now());
-  for (const u of users) startUserAuto(u.id);
-  console.log(`Restored auto for ${users.length} users`);
+  try {
+    const users = await db.allAsync('SELECT id FROM users WHERE auto_on = 1 AND key_expires > ?', Date.now());
+    for (const u of users) startUserAuto(u.id);
+    console.log(`Restored auto for ${users.length} users`);
+  } catch(e) { console.error('Restore auto error:', e); }
 }
 
 // ========== WEB DASHBOARD ==========
@@ -803,12 +800,12 @@ app.get('/dashboard', async (req, res) => {
     </style></head>
     <body><h1>📊 LC79 Admin Dashboard</h1>
     <h2>Users (${users.length})</h2>
-    <table>
+     <table>
        <thead><tr><th>ID</th><th>Name</th><th>Username</th><th>Key</th><th>Expiry</th><th>Source</th><th>Auto</th></tr></thead>
        <tbody>${users.map(u => `<tr><td>${u.id}</td><td>${u.first_name||''}</td><td>${u.username||''}</td><td>${u.key||''}</td><td>${u.key_expires ? new Date(u.key_expires).toLocaleString('vi') : '∞'}</td><td>V${u.source||3}</td><td>${u.auto_on?'✅':'⏹'}</td></tr>`).join('')}</tbody>
      </table>
     <h2>Keys (${keys.length})</h2>
-    <table>
+     <table>
        <thead><tr><th>Code</th><th>Name</th><th>Expires</th><th>UsedBy</th></tr></thead>
        <tbody>${keys.map(k => `<tr><td>${k.code}</td><td>${k.name}</td><td>${k.expires ? new Date(k.expires).toLocaleString('vi') : '∞'}</td><td>${k.usedBy||''}</td></tr>`).join('')}</tbody>
      </table>
@@ -831,7 +828,7 @@ function backupDatabase() {
 }
 setInterval(backupDatabase, 24 * 60 * 60 * 1000);
 
-// Khởi động bot sau khi DB đã sẵn sàng
+// Khởi động bot sau khi DB sẵn sàng
 (async () => {
   try {
     await initDB();               // Đợi tạo bảng xong
